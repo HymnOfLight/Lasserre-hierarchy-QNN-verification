@@ -55,7 +55,7 @@ class RobustnessVerifier:
         network: QuantizedNetwork,
         poly_degree: int = 4,
         max_lasserre_order: int = 3,
-        solver: str = "SCS",
+        solver: str = "GUROBI",
         verbose: bool = False,
     ):
         self.network = network
@@ -422,7 +422,11 @@ class RobustnessVerifier:
     def _solve_last_layer_lp(
         self, W, b, n_in, n_out, y_true, y_target, propagator
     ) -> Dict:
-        """Tight LP bound on the margin for the last linear layer."""
+        """
+        Tight LP bound on the margin for the last linear layer.
+        Uses Gurobi for the LP solve when available, otherwise falls
+        back to closed-form interval arithmetic.
+        """
         last_idx = -1
         for i, layer in enumerate(self.network.layers):
             if layer.layer_type == "linear":
@@ -430,8 +434,28 @@ class RobustnessVerifier:
 
         pre_l, pre_u = self._get_prelogit_bounds(propagator, last_idx, n_in)
 
-        diff_w = W[y_true, :] - W[y_target, :]
-        diff_b = b[y_true] - b[y_target]
+        diff_w = (W[y_true, :] - W[y_target, :]).astype(np.float64)
+        diff_b = float(b[y_true] - b[y_target])
+
+        # Try Gurobi first
+        try:
+            from ..lasserre.sdp_solver import GurobiLPSolver
+            gurobi_lp = GurobiLPSolver(verbose=self.verbose)
+            result = gurobi_lp.solve_margin_lp(diff_w, diff_b, pre_l, pre_u)
+            if result["status"] == "optimal":
+                margin_lb = result["optimal_value"]
+                return {
+                    "lower_bound": float(margin_lb),
+                    "method": "last_layer_LP_gurobi",
+                    "n_vars": n_in,
+                    "certificate": {"certified": margin_lb > 0, "order": 0,
+                                    "solver_status": "gurobi_optimal"},
+                }
+            logger.warning(f"Gurobi LP status: {result['status']}, falling back to interval arithmetic")
+        except Exception as e:
+            logger.warning(f"Gurobi LP unavailable ({e}), using interval arithmetic")
+
+        # Fallback: closed-form interval arithmetic
         diff_pos = np.maximum(diff_w, 0)
         diff_neg = np.minimum(diff_w, 0)
         margin_lb = float(diff_pos @ pre_l + diff_neg @ pre_u + diff_b)
@@ -441,7 +465,7 @@ class RobustnessVerifier:
             "method": "last_layer_LP",
             "n_vars": n_in,
             "certificate": {"certified": margin_lb > 0, "order": 0,
-                            "solver_status": "LP_bound"},
+                            "solver_status": "interval_arithmetic"},
         }
 
     def _solve_last_layer_sdp(

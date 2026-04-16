@@ -44,7 +44,7 @@ class VerificationCertificate:
     verification_method: str = "Lasserre_hierarchy"
     relaxation_order: int = 1
     polynomial_degree: int = 4
-    solver_used: str = "SCS"
+    solver_used: str = "GUROBI"
     solver_status: str = "unknown"
 
     # Proof data

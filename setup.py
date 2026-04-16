@@ -12,6 +12,7 @@ setup(
         "numpy>=1.24.0",
         "scipy>=1.10.0",
         "cvxpy>=1.3.0",
+        "gurobipy>=10.0.0",
         "sympy>=1.12",
         "networkx>=3.0",
         "matplotlib>=3.7.0",

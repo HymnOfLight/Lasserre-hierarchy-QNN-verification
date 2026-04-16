@@ -5,6 +5,7 @@ import pytest
 
 from qnn_verifier.lasserre.moment_matrix import MonomialBasis, MomentMatrix
 from qnn_verifier.lasserre.sos_relaxation import SOSRelaxation
+from qnn_verifier.lasserre.sdp_solver import GurobiLPSolver
 from qnn_verifier.lasserre.hierarchy import LasserreHierarchy
 
 
@@ -87,7 +88,7 @@ class TestSOSRelaxation:
 class TestLasserreHierarchy:
     def test_simple_optimization(self):
         """Test: minimize x subject to -1 <= x <= 1."""
-        h = LasserreHierarchy(n_vars=1, max_order=2, solver_name="SCS")
+        h = LasserreHierarchy(n_vars=1, max_order=2)
         h.set_objective({(1,): 1.0})
         h.add_inequality({(0,): 1.0, (1,): 1.0})   # x + 1 >= 0
         h.add_inequality({(0,): 1.0, (1,): -1.0})  # 1 - x >= 0
@@ -104,7 +105,7 @@ class TestLasserreHierarchy:
         assert h.minimum_feasible_order() >= 1
 
     def test_certificate(self):
-        h = LasserreHierarchy(n_vars=1, max_order=2, solver_name="SCS")
+        h = LasserreHierarchy(n_vars=1, max_order=2)
         h.set_objective({(2,): 1.0, (0,): -0.5})  # x^2 - 0.5
         h.add_inequality({(0,): 1.0, (1,): 1.0})
         h.add_inequality({(0,): 1.0, (1,): -1.0})
@@ -113,3 +114,42 @@ class TestLasserreHierarchy:
         cert = h.get_verification_certificate()
         assert "lower_bound" in cert
         assert "certified" in cert
+
+
+class TestGurobiLPSolver:
+    def test_simple_lp(self):
+        """min x s.t. -1 <= x <= 1  →  opt = -1."""
+        solver = GurobiLPSolver(verbose=False)
+        result = solver.minimize_linear(
+            c=np.array([1.0]),
+            lb=np.array([-1.0]),
+            ub=np.array([1.0]),
+        )
+        assert result["status"] == "optimal"
+        assert abs(result["optimal_value"] - (-1.0)) < 1e-6
+
+    def test_margin_lp(self):
+        """Margin LP: min w^T h + b, w=[1,-1], b=0, h in [0,1]^2."""
+        solver = GurobiLPSolver(verbose=False)
+        result = solver.solve_margin_lp(
+            diff_w=np.array([1.0, -1.0]),
+            diff_b=0.0,
+            lb=np.array([0.0, 0.0]),
+            ub=np.array([1.0, 1.0]),
+        )
+        assert result["status"] == "optimal"
+        # min h0 - h1 = 0 - 1 = -1
+        assert abs(result["optimal_value"] - (-1.0)) < 1e-6
+
+    def test_certified_margin(self):
+        """Case where margin is strictly positive → certified."""
+        solver = GurobiLPSolver(verbose=False)
+        result = solver.solve_margin_lp(
+            diff_w=np.array([1.0, 1.0]),
+            diff_b=0.5,
+            lb=np.array([0.0, 0.0]),
+            ub=np.array([1.0, 1.0]),
+        )
+        assert result["status"] == "optimal"
+        # min (h0 + h1) + 0.5 = 0 + 0 + 0.5 = 0.5
+        assert result["optimal_value"] > 0
