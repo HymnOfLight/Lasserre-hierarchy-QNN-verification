@@ -129,7 +129,7 @@ class SDPSolver:
 
     def __init__(
         self,
-        solver: str = "GUROBI",
+        solver: str = "SCS",
         verbose: bool = False,
         max_iters: int = 10000,
         eps: float = 1e-7,

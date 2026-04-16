@@ -45,7 +45,7 @@ class VerificationPipeline:
         n_bits: int = 8,
         poly_degree: int = 4,
         max_lasserre_order: int = 3,
-        solver: str = "GUROBI",
+        solver: str = "SCS",
         verbose: bool = False,
     ):
         self.model_path = model_path

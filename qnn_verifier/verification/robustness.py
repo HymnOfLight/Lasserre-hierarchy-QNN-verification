@@ -55,7 +55,7 @@ class RobustnessVerifier:
         network: QuantizedNetwork,
         poly_degree: int = 4,
         max_lasserre_order: int = 3,
-        solver: str = "GUROBI",
+        solver: str = "SCS",
         verbose: bool = False,
     ):
         self.network = network

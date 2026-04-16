@@ -32,7 +32,7 @@ class LasserreHierarchy:
         self,
         n_vars: int,
         max_order: int = 3,
-        solver_name: str = "GUROBI",
+        solver_name: str = "SCS",
         verbose: bool = False,
         convergence_tol: float = 1e-4,
     ):
