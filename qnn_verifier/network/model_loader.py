@@ -71,6 +71,7 @@ def load_quantized_model(
     network.metadata["model_path"] = model_path
     network.metadata["model_arch"] = model_arch
     network.metadata["n_bits"] = n_bits
+    network.metadata["torch_model"] = model
     network.n_classes = n_classes
 
     return network
@@ -347,4 +348,5 @@ def create_small_quantized_model(
             )
 
     network.output_shape = (n_classes,)
+    network.metadata["torch_model"] = model
     return model, network
