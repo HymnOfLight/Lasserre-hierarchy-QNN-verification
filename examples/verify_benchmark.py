@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Example: Download and verify VNN-COMP benchmark instances.
+Verify VNN-COMP benchmark instances with the Lasserre hierarchy framework.
 
 Supports ACAS Xu and all VNN-COMP 2024 complex benchmarks:
   acasxu, cGAN, NN4Sys, LinearizeNN, ml4acopf, ViT,
@@ -9,23 +9,20 @@ Supports ACAS Xu and all VNN-COMP 2024 complex benchmarks:
 Models are downloaded to ./benchmarks_data/ in the project directory.
 
 Usage:
-    # List available benchmarks
+    # List all benchmarks
     python verify_benchmark.py --list
 
-    # Download ACAS Xu benchmark
+    # Download ACAS Xu
     python verify_benchmark.py --download acasxu
 
-    # Download all benchmarks (small models only, skip large downloads)
-    python verify_benchmark.py --download-all --skip-large
-
-    # Download and verify ACAS Xu instance #0
+    # Verify ACAS Xu instance 0
     python verify_benchmark.py --benchmark acasxu --instance 0
 
-    # Verify multiple instances
+    # Verify instances 0-9
     python verify_benchmark.py --benchmark acasxu --instances 0-9
 
-    # Verify with Lasserre SDP refinement
-    python verify_benchmark.py --benchmark linearizenn --instance 0 --use-sdp
+    # Verify all instances of a benchmark
+    python verify_benchmark.py --benchmark linearizenn --all
 """
 
 import argparse
@@ -40,10 +37,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from qnn_verifier.benchmarks import (
     BENCHMARKS,
-    list_benchmarks,
     download_benchmark,
     download_all,
     load_benchmark_instance,
+    verify_instance,
 )
 from qnn_verifier.benchmarks.loader import list_instances
 
@@ -55,109 +52,78 @@ logger = logging.getLogger(__name__)
 
 
 def print_benchmarks():
-    """Print all available benchmarks."""
-    print("\n" + "=" * 72)
-    print(f"  {'Name':<22} {'Category':<10} {'Description'}")
-    print("=" * 72)
+    print("\n" + "=" * 76)
+    print(f"  {'Key':<22} {'Cat':<8} {'Description':<40} {'DL'}")
+    print("=" * 76)
     for key, info in BENCHMARKS.items():
-        large = " [LARGE]" if info.needs_large_download else ""
-        print(f"  {key:<22} {info.category:<10} {info.description[:50]}...{large}")
-    print("=" * 72)
-    print(f"\n  Total: {len(BENCHMARKS)} benchmarks")
-    print(f"  Classic: {sum(1 for b in BENCHMARKS.values() if b.category == 'classic')}")
-    print(f"  Complex: {sum(1 for b in BENCHMARKS.values() if b.category == 'complex')}")
-    print()
+        large = "LARGE" if info.needs_large_download else ""
+        print(f"  {key:<22} {info.category:<8} {info.description[:40]:<40} {large}")
+    print("=" * 76)
+    print(f"  Total: {len(BENCHMARKS)} benchmarks  "
+          f"(Classic: {sum(1 for b in BENCHMARKS.values() if b.category == 'classic')}, "
+          f"Complex: {sum(1 for b in BENCHMARKS.values() if b.category == 'complex')})")
 
 
-def verify_instance(benchmark_name: str, instance_idx: int, use_sdp: bool = False):
-    """Download (if needed), load, and verify a single benchmark instance."""
-    # Download
+def run_verification(benchmark_name: str, indices: list, timeout: float = None):
+    """Download, load, and verify benchmark instances."""
     try:
         bench_dir = download_benchmark(benchmark_name, skip_large=False)
-    except Exception as e:
-        logger.error(f"Download failed: {e}")
+    except Exception:
         logger.info("Retrying with skip_large=True...")
         bench_dir = download_benchmark(benchmark_name, skip_large=True)
 
-    # Load instance
-    inst = load_benchmark_instance(benchmark_name, instance_idx)
+    info = BENCHMARKS[benchmark_name]
+    all_inst = list_instances(benchmark_name)
 
-    print(f"\n--- {BENCHMARKS[benchmark_name].name} Instance #{instance_idx} ---")
-    print(f"  Model    : {Path(inst.model_path).name}")
-    print(f"  Property : {Path(inst.property_path).name}")
-    print(f"  Timeout  : {inst.timeout}s")
+    if not indices:
+        indices = list(range(len(all_inst)))
 
-    if inst.property is not None:
-        prop = inst.property
-        print(f"  Inputs   : {prop.n_inputs}")
-        print(f"  Outputs  : {prop.n_outputs}")
-        if prop.input_lower is not None:
-            finite_lb = np.isfinite(prop.input_lower).sum()
-            finite_ub = np.isfinite(prop.input_upper).sum()
-            print(f"  Bounded  : {finite_lb}/{prop.n_inputs} lower, {finite_ub}/{prop.n_inputs} upper")
-            if finite_lb > 0 and finite_ub > 0:
-                widths = prop.input_upper - prop.input_lower
-                finite_widths = widths[np.isfinite(widths)]
-                if len(finite_widths) > 0:
-                    print(f"  Eps range: [{finite_widths.min():.6f}, {finite_widths.max():.6f}]")
-        print(f"  Output constraints: {len(prop.output_constraints)}")
+    print(f"\n{'='*76}")
+    print(f"  Verifying: {info.name}  ({len(indices)} instances)")
+    print(f"{'='*76}")
 
-    if inst.model is not None:
-        print(f"  Input shape : {inst.input_shape}")
-        print(f"  Output shape: {inst.output_shape}")
+    results_summary = {"verified": 0, "violated": 0, "unknown": 0, "error": 0, "timeout": 0}
+    total_time = 0.0
 
-        # Run a forward pass to test
+    for idx in indices:
+        if idx >= len(all_inst):
+            print(f"  [SKIP] Instance {idx} out of range (max {len(all_inst)-1})")
+            continue
+
         try:
-            import torch
-            n_in = int(np.prod(inst.input_shape))
-            if inst.property is not None and inst.property.input_lower is not None:
-                lb = inst.property.input_lower
-                ub = inst.property.input_upper
-                lb = np.where(np.isfinite(lb), lb, -1.0)
-                ub = np.where(np.isfinite(ub), ub, 1.0)
-                x0 = (lb + ub) / 2.0
-            else:
-                x0 = np.zeros(n_in)
-
-            x_tensor = torch.tensor(x0, dtype=torch.float32).reshape(inst.input_shape)
-            t0 = time.time()
-            with torch.no_grad():
-                output = inst.model(x_tensor)
-            fwd_time = time.time() - t0
-            print(f"  Forward pass: {fwd_time:.4f}s")
-            print(f"  Output (first 5): {output.flatten()[:5].tolist()}")
-
-            # If property has output constraints, check nominal satisfaction
-            if inst.property and inst.property.output_constraints:
-                out_np = output.flatten().numpy()
-                print(f"  Nominal argmax: {np.argmax(out_np)}")
+            inst = load_benchmark_instance(benchmark_name, idx)
+            res = verify_instance(inst, timeout=timeout)
+            results_summary[res.result] = results_summary.get(res.result, 0) + 1
+            total_time += res.time_seconds
+            print(f"  [{idx:3d}] {res}")
         except Exception as e:
-            print(f"  Forward pass failed: {e}")
-    else:
-        print("  (Model not loaded — install onnx2pytorch or onnxruntime)")
+            results_summary["error"] += 1
+            print(f"  [{idx:3d}] [ERROR     ] {e}")
 
-    return inst
+    print(f"\n{'='*76}")
+    print(f"  Summary: {info.name}")
+    print(f"    Verified : {results_summary['verified']}")
+    print(f"    Violated : {results_summary['violated']}")
+    print(f"    Unknown  : {results_summary['unknown']}")
+    print(f"    Error    : {results_summary['error']}")
+    print(f"    Total    : {sum(results_summary.values())} instances, {total_time:.2f}s")
+    print(f"{'='*76}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="VNN-COMP benchmark verification")
-    parser.add_argument("--list", action="store_true", help="List available benchmarks")
-    parser.add_argument("--download", type=str, default=None,
-                        help="Download a specific benchmark")
-    parser.add_argument("--download-all", action="store_true",
-                        help="Download all benchmarks")
-    parser.add_argument("--skip-large", action="store_true",
-                        help="Skip benchmarks that need large downloads")
-    parser.add_argument("--benchmark", type=str, default=None,
-                        help="Benchmark to verify (e.g. acasxu)")
-    parser.add_argument("--instance", type=int, default=0,
-                        help="Instance index to verify")
+    parser.add_argument("--list", action="store_true")
+    parser.add_argument("--download", type=str, default=None)
+    parser.add_argument("--download-all", action="store_true")
+    parser.add_argument("--skip-large", action="store_true")
+    parser.add_argument("--benchmark", type=str, default=None)
+    parser.add_argument("--instance", type=int, default=None)
     parser.add_argument("--instances", type=str, default=None,
-                        help="Instance range (e.g. '0-9')")
-    parser.add_argument("--use-sdp", action="store_true",
-                        help="Use Lasserre SDP refinement")
-    parser.add_argument("--list-instances", type=str, default=None,
-                        help="List instances for a benchmark")
+                        help="Range e.g. '0-9'")
+    parser.add_argument("--all", action="store_true",
+                        help="Verify all instances")
+    parser.add_argument("--timeout", type=float, default=None)
+    parser.add_argument("--list-instances", type=str, default=None)
     args = parser.parse_args()
 
     if args.list:
@@ -165,47 +131,44 @@ def main():
         return
 
     if args.download:
-        print(f"Downloading benchmark: {args.download}")
         path = download_benchmark(args.download, skip_large=args.skip_large)
         print(f"Downloaded to: {path}")
         return
 
     if args.download_all:
-        print("Downloading all benchmarks...")
         paths = download_all(skip_large=args.skip_large)
         for name, path in paths.items():
-            status = "OK" if path else "FAILED"
-            print(f"  {name:<22} {status}")
+            print(f"  {name:<22} {'OK' if path else 'FAILED'}")
         return
 
     if args.list_instances:
-        bench_dir = download_benchmark(args.list_instances, skip_large=True)
+        download_benchmark(args.list_instances, skip_large=True)
         instances = list_instances(args.list_instances)
         print(f"\n{BENCHMARKS[args.list_instances].name}: {len(instances)} instances")
-        for i, (model, prop, timeout) in enumerate(instances[:20]):
-            print(f"  [{i:3d}] {Path(model).name:<45} {Path(prop).name}")
+        for i, (m, p, t) in enumerate(instances[:20]):
+            print(f"  [{i:3d}] {Path(m).name:<45} {Path(p).name}")
         if len(instances) > 20:
-            print(f"  ... and {len(instances) - 20} more")
+            print(f"  ... and {len(instances)-20} more")
         return
 
     if args.benchmark:
-        if args.instances:
+        if args.all:
+            indices = []  # empty = all
+        elif args.instances:
             parts = args.instances.split("-")
-            start, end = int(parts[0]), int(parts[1])
-            for i in range(start, end + 1):
-                try:
-                    verify_instance(args.benchmark, i, args.use_sdp)
-                except Exception as e:
-                    print(f"  Instance {i} failed: {e}")
+            indices = list(range(int(parts[0]), int(parts[1]) + 1))
+        elif args.instance is not None:
+            indices = [args.instance]
         else:
-            verify_instance(args.benchmark, args.instance, args.use_sdp)
+            indices = [0]
+        run_verification(args.benchmark, indices, args.timeout)
         return
 
     print_benchmarks()
-    print("Usage examples:")
+    print("\nExamples:")
     print("  python verify_benchmark.py --download acasxu")
-    print("  python verify_benchmark.py --benchmark acasxu --instance 0")
-    print("  python verify_benchmark.py --benchmark acasxu --instances 0-4")
+    print("  python verify_benchmark.py --benchmark acasxu --instances 0-9")
+    print("  python verify_benchmark.py --benchmark linearizenn --all")
 
 
 if __name__ == "__main__":
