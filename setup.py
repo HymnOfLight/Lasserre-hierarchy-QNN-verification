@@ -17,6 +17,8 @@ setup(
         "accelerate>=0.26.0",
         "sentencepiece>=0.1.99",
         "modelscope>=1.10.0",
+        "onnx>=1.14.0",
+        "onnxruntime>=1.16.0",
         "sympy>=1.12",
         "networkx>=3.0",
         "matplotlib>=3.7.0",
