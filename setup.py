@@ -16,6 +16,7 @@ setup(
         "transformers>=4.37.0",
         "accelerate>=0.26.0",
         "sentencepiece>=0.1.99",
+        "modelscope>=1.10.0",
         "sympy>=1.12",
         "networkx>=3.0",
         "matplotlib>=3.7.0",
