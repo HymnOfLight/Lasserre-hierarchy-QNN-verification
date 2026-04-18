@@ -52,6 +52,8 @@ def verify_instance(
     instance: BenchmarkInstance,
     timeout: Optional[float] = None,
     method: str = "jacobian",
+    n_workers: int = 0,
+    threads_per_worker: int = 0,
 ) -> BenchmarkVerificationResult:
     """
     Verify a benchmark instance.
@@ -60,12 +62,16 @@ def verify_instance(
         instance: BenchmarkInstance with model and property loaded.
         timeout: Override the instance timeout (seconds).
         method: "jacobian" (fast), "z3" (exact SMT), or "sdp" (Lasserre).
+        n_workers: Z3 parallel workers (0=auto).
+        threads_per_worker: Z3 internal threads per worker (0=auto).
 
     Returns:
         BenchmarkVerificationResult.
     """
     if method == "z3":
-        return _verify_with_z3_wrapper(instance, timeout)
+        return _verify_with_z3_wrapper(instance, timeout, n_workers, threads_per_worker)
+    if method in ("smt", "portfolio", "cvc5", "bitwuzla", "opensmt"):
+        return _verify_with_smt_portfolio(instance, timeout, method, n_workers, threads_per_worker)
 
     from pathlib import Path
     t0 = time.time()
@@ -465,8 +471,10 @@ def _check_constraint_point(
 def _verify_with_z3_wrapper(
     instance: BenchmarkInstance,
     timeout: Optional[float] = None,
+    n_workers: int = 0,
+    threads_per_worker: int = 0,
 ) -> BenchmarkVerificationResult:
-    """Dispatch verification to the Z3-based exact solver."""
+    """Dispatch verification to the Z3-based multi-core solver."""
     from pathlib import Path
     from .z3_solver import verify_with_z3
 
@@ -491,6 +499,8 @@ def _verify_with_z3_wrapper(
         property=instance.property,
         timeout=max_time,
         input_shape=instance.input_shape,
+        n_workers=n_workers,
+        threads_per_worker=threads_per_worker,
     )
 
     res.result = z3_result["result"]
@@ -500,5 +510,61 @@ def _verify_with_z3_wrapper(
 
     if "counterexample_input" in z3_result:
         res.details += f" | CEX input: {z3_result['counterexample_input'][:5]}"
+
+    return res
+
+
+def _verify_with_smt_portfolio(
+    instance: BenchmarkInstance,
+    timeout: Optional[float] = None,
+    method: str = "smt",
+    n_workers: int = 0,
+    threads_per_worker: int = 0,
+) -> BenchmarkVerificationResult:
+    """Dispatch to multi-solver SMT portfolio."""
+    from pathlib import Path
+    from .smt_solver import verify_with_smt
+
+    res = BenchmarkVerificationResult(
+        benchmark=instance.benchmark_name,
+        model_name=Path(instance.model_path).stem,
+        property_name=Path(instance.property_path).stem,
+    )
+
+    if instance.property is None:
+        res.result = "error"
+        res.details = "Property not loaded"
+        return res
+    if not Path(instance.model_path).exists():
+        res.result = "error"
+        res.details = "Model file not found"
+        return res
+
+    max_time = timeout or instance.timeout or 300.0
+
+    # Map method name to solver list
+    if method in ("smt", "portfolio"):
+        solvers = None  # auto-detect all
+    elif method == "cvc5":
+        solvers = ["cvc5"]
+    elif method == "bitwuzla":
+        solvers = ["bitwuzla"]
+    elif method == "opensmt":
+        solvers = ["opensmt"]
+    else:
+        solvers = None
+
+    smt_result = verify_with_smt(
+        onnx_path=instance.model_path,
+        property=instance.property,
+        timeout=max_time,
+        solvers=solvers,
+        n_threads=threads_per_worker,
+    )
+
+    res.result = smt_result["result"]
+    res.time_seconds = smt_result["time_seconds"]
+    res.method = smt_result.get("solver", method)
+    res.details = smt_result.get("details", "")
 
     return res

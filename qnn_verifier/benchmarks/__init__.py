@@ -15,6 +15,7 @@ from .loader import load_benchmark_instance, load_onnx_model
 from .vnnlib_parser import parse_vnnlib
 from .verifier import verify_instance, BenchmarkVerificationResult
 from .z3_solver import verify_with_z3
+from .smt_solver import verify_with_smt
 
 __all__ = [
     "BENCHMARKS",

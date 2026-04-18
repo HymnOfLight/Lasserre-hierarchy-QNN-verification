@@ -68,7 +68,8 @@ def print_benchmarks():
 
 
 def run_verification(benchmark_name: str, indices: list, timeout: float = None,
-                     solver: str = "jacobian"):
+                     solver: str = "jacobian", n_workers: int = 0,
+                     threads_per_worker: int = 0):
     """Download, load, and verify benchmark instances."""
     try:
         bench_dir = download_benchmark(benchmark_name, skip_large=False)
@@ -97,7 +98,8 @@ def run_verification(benchmark_name: str, indices: list, timeout: float = None,
 
         try:
             inst = load_benchmark_instance(benchmark_name, idx)
-            res = verify_instance(inst, timeout=timeout, method=solver)
+            res = verify_instance(inst, timeout=timeout, method=solver,
+                                  n_workers=n_workers, threads_per_worker=threads_per_worker)
             results_summary[res.result] = results_summary.get(res.result, 0) + 1
             total_time += res.time_seconds
             print(f"  [{idx:3d}] {res}")
@@ -128,8 +130,15 @@ def main():
     parser.add_argument("--all", action="store_true",
                         help="Verify all instances")
     parser.add_argument("--solver", type=str, default="jacobian",
-                        choices=["jacobian", "z3", "sdp"],
-                        help="Solver: jacobian (fast), z3 (exact SMT), sdp (Lasserre)")
+                        choices=["jacobian", "z3", "cvc5", "bitwuzla", "opensmt",
+                                 "smt", "portfolio", "sdp"],
+                        help="Solver: jacobian (fast), z3/cvc5/bitwuzla/opensmt "
+                             "(single SMT), smt/portfolio (all SMT solvers in "
+                             "parallel), sdp (Lasserre)")
+    parser.add_argument("--workers", type=int, default=0,
+                        help="Z3 parallel workers (0=auto, all cores)")
+    parser.add_argument("--threads", type=int, default=0,
+                        help="Z3 internal threads per worker (0=auto)")
     parser.add_argument("--timeout", type=float, default=None)
     parser.add_argument("--list-instances", type=str, default=None)
     args = parser.parse_args()
@@ -169,7 +178,8 @@ def main():
             indices = [args.instance]
         else:
             indices = [0]
-        run_verification(args.benchmark, indices, args.timeout, args.solver)
+        run_verification(args.benchmark, indices, args.timeout, args.solver,
+                         args.workers, args.threads)
         return
 
     print_benchmarks()

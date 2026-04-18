@@ -1,5 +1,5 @@
 """
-Z3-based exact neural network verification solver.
+Z3-based exact neural network verification solver with multi-core support.
 
 Encodes the neural network as an SMT formula over real arithmetic,
 adds the VNNLIB input/output constraints, and checks satisfiability.
@@ -7,11 +7,20 @@ adds the VNNLIB input/output constraints, and checks satisfiability.
   SAT   → unsafe region reachable → property VIOLATED
   UNSAT → unsafe region unreachable → property VERIFIED (exact proof)
 
-Supports ReLU networks loaded from ONNX via weight matrix extraction.
+Parallelism strategy:
+  1. IBP pre-processing: determine stable neurons (always active / always
+     inactive) to eliminate trivial ReLU branches.
+  2. Z3 parallel mode: enable built-in parallel solving with configurable
+     thread count.
+  3. Multi-process portfolio: split the problem by fixing unstable neuron
+     phases and solve sub-problems in parallel worker processes.
 """
 
 import logging
+import multiprocessing
+import os
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -19,12 +28,14 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+# ------------------------------------------------------------------
+# ONNX weight extraction
+# ------------------------------------------------------------------
+
 def _extract_weights_from_onnx(onnx_path: str) -> List[Dict]:
     """
     Extract weight matrices and biases from an ONNX model.
-
-    Returns a list of layers with types "linear" (with W, b) and "relu".
-    The weight matrix W has shape (n_out, n_in), so y = W @ x + b.
+    Returns a list of layers with types "linear" (W, b) and "relu".
     """
     import onnx
     from onnx import numpy_helper
@@ -36,21 +47,16 @@ def _extract_weights_from_onnx(onnx_path: str) -> List[Dict]:
     for init in graph.initializer:
         initializers[init.name] = numpy_helper.to_array(init)
 
-    # Infer output name → shape from graph value_info and outputs
     raw_layers = []
     for node in graph.node:
         op = node.op_type
 
         if op in ("Gemm", "MatMul"):
-            W = None
-            b = None
-            transpose_B = False
-
+            W, b, transpose_B = None, None, False
             if op == "Gemm":
                 for attr in node.attribute:
                     if attr.name == "transB":
                         transpose_B = bool(attr.i)
-
             for inp_name in node.input:
                 if inp_name in initializers:
                     arr = initializers[inp_name]
@@ -58,28 +64,17 @@ def _extract_weights_from_onnx(onnx_path: str) -> List[Dict]:
                         W = arr
                     elif arr.ndim == 1:
                         b = arr
-
             if W is not None:
-                # For Gemm: y = x @ W^T + b  (when transB=1) → W_eff = W
-                # For Gemm: y = x @ W + b    (when transB=0) → W_eff = W^T
-                # We want W_eff such that y = W_eff @ x + b
-                if transpose_B:
-                    W_eff = W.astype(np.float64)  # W is already (n_out, n_in)
-                else:
-                    W_eff = W.T.astype(np.float64)
-
+                W_eff = W.astype(np.float64) if transpose_B else W.T.astype(np.float64)
                 raw_layers.append({
                     "type": "linear",
                     "W": W_eff,
                     "b": b.astype(np.float64) if b is not None else np.zeros(W_eff.shape[0], dtype=np.float64),
                 })
-
         elif op == "Relu":
             raw_layers.append({"type": "relu"})
-
         elif op in ("Flatten", "Reshape"):
             raw_layers.append({"type": "flatten"})
-
         elif op == "Add":
             b = None
             for inp_name in node.input:
@@ -90,7 +85,6 @@ def _extract_weights_from_onnx(onnx_path: str) -> List[Dict]:
             if b is not None:
                 raw_layers.append({"type": "add_bias", "b": b.astype(np.float64)})
 
-    # Merge add_bias into preceding linear layer
     layers = []
     for l in raw_layers:
         if l["type"] == "add_bias" and layers and layers[-1]["type"] == "linear":
@@ -103,28 +97,257 @@ def _extract_weights_from_onnx(onnx_path: str) -> List[Dict]:
     return layers
 
 
+# ------------------------------------------------------------------
+# IBP pre-processing: identify stable ReLU neurons
+# ------------------------------------------------------------------
+
+def _ibp_stable_neurons(
+    layers: List[Dict],
+    input_lb: np.ndarray,
+    input_ub: np.ndarray,
+) -> Dict[Tuple[int, int], str]:
+    """
+    Run interval bound propagation to classify each ReLU neuron as:
+      "active"   — always non-negative → ReLU is identity
+      "inactive" — always negative → ReLU is zero
+      "unstable" — crosses zero → needs branching
+
+    Returns dict mapping (relu_layer_idx, neuron_idx) → status.
+    """
+    current_lb = input_lb.copy()
+    current_ub = input_ub.copy()
+
+    stable = {}
+    relu_layer = 0
+
+    for layer in layers:
+        if layer["type"] == "linear":
+            W = layer["W"]
+            b = layer["b"]
+            n_out, n_in = W.shape
+            lb_in = current_lb[:n_in] if len(current_lb) >= n_in else np.pad(current_lb, (0, n_in - len(current_lb)))
+            ub_in = current_ub[:n_in] if len(current_ub) >= n_in else np.pad(current_ub, (0, n_in - len(current_ub)))
+            W_pos = np.maximum(W, 0)
+            W_neg = np.minimum(W, 0)
+            current_lb = W_pos @ lb_in + W_neg @ ub_in + b
+            current_ub = W_pos @ ub_in + W_neg @ lb_in + b
+
+        elif layer["type"] == "relu":
+            n = len(current_lb)
+            for j in range(n):
+                if current_lb[j] >= 0:
+                    stable[(relu_layer, j)] = "active"
+                elif current_ub[j] <= 0:
+                    stable[(relu_layer, j)] = "inactive"
+                else:
+                    stable[(relu_layer, j)] = "unstable"
+            current_lb = np.maximum(current_lb, 0)
+            current_ub = np.maximum(current_ub, 0)
+            relu_layer += 1
+
+        elif layer["type"] == "flatten":
+            pass
+
+    return stable
+
+
+# ------------------------------------------------------------------
+# Z3 formula builder
+# ------------------------------------------------------------------
+
+def _build_z3_formula(
+    layers: List[Dict],
+    n_inputs: int,
+    n_outputs: int,
+    input_lb: np.ndarray,
+    input_ub: np.ndarray,
+    output_constraints: List[Dict],
+    stable_neurons: Dict[Tuple[int, int], str],
+    fixed_phases: Optional[Dict[Tuple[int, int], bool]] = None,
+    parallel_threads: int = 1,
+    timeout_ms: int = 60000,
+):
+    """
+    Build and solve a Z3 formula encoding the neural network.
+
+    Args:
+        fixed_phases: Optional dict mapping (relu_layer, neuron) → True (active)
+                      / False (inactive) for portfolio sub-problem splitting.
+        parallel_threads: Z3 internal parallel thread count.
+    """
+    import z3
+
+    if parallel_threads > 1:
+        z3.set_param("parallel.enable", True)
+        z3.set_param("parallel.threads.max", parallel_threads)
+    else:
+        z3.set_param("parallel.enable", False)
+
+    X = [z3.Real(f"X_{i}") for i in range(n_inputs)]
+    Y_out = [z3.Real(f"Y_{i}") for i in range(n_outputs)]
+
+    solver = z3.Solver()
+    solver.set("timeout", timeout_ms)
+
+    # Input bounds
+    for i in range(n_inputs):
+        if np.isfinite(input_lb[i]):
+            solver.add(X[i] >= z3.RealVal(float(input_lb[i])))
+        if np.isfinite(input_ub[i]):
+            solver.add(X[i] <= z3.RealVal(float(input_ub[i])))
+
+    current_vars = X
+    relu_layer = 0
+    layer_idx = 0
+
+    # Pre-compute Z3 RealVal constants for all weights (batch for speed)
+    _rv_cache = {}
+    def _rv(f: float):
+        if f not in _rv_cache:
+            _rv_cache[f] = z3.RealVal(f)
+        return _rv_cache[f]
+
+    for layer in layers:
+        if layer["type"] == "linear":
+            W = layer["W"]
+            b = layer["b"]
+            n_out, n_in = W.shape
+            in_vars = current_vars[:n_in]
+            if len(in_vars) < n_in:
+                in_vars = in_vars + [_rv(0.0)] * (n_in - len(in_vars))
+
+            # Sparse encoding: only add non-zero weight terms
+            out_vars = []
+            for j in range(n_out):
+                h = z3.Real(f"h_{layer_idx}_{j}")
+                nz = np.nonzero(np.abs(W[j, :]) > 1e-15)[0]
+                if len(nz) == 0:
+                    solver.add(h == _rv(float(b[j])))
+                else:
+                    terms = [_rv(float(b[j]))]
+                    for k in nz:
+                        terms.append(_rv(float(W[j, k])) * in_vars[k])
+                    solver.add(h == z3.Sum(terms))
+                out_vars.append(h)
+            current_vars = out_vars
+            layer_idx += 1
+
+        elif layer["type"] == "relu":
+            relu_vars = []
+            for j, v in enumerate(current_vars):
+                key = (relu_layer, j)
+                status = stable_neurons.get(key, "unstable")
+
+                if fixed_phases and key in fixed_phases:
+                    phase = fixed_phases[key]
+                    r = z3.Real(f"r_{relu_layer}_{j}")
+                    if phase:
+                        solver.add(v >= 0)
+                        solver.add(r == v)
+                    else:
+                        solver.add(v <= 0)
+                        solver.add(r == 0)
+                    relu_vars.append(r)
+
+                elif status == "active":
+                    relu_vars.append(v)
+
+                elif status == "inactive":
+                    r = z3.Real(f"r_{relu_layer}_{j}")
+                    solver.add(r == 0)
+                    relu_vars.append(r)
+
+                else:
+                    r = z3.Real(f"r_{relu_layer}_{j}")
+                    solver.add(r >= 0)
+                    solver.add(r >= v)
+                    solver.add(z3.Or(r == 0, r == v))
+                    relu_vars.append(r)
+
+            current_vars = relu_vars
+            relu_layer += 1
+
+        elif layer["type"] == "flatten":
+            pass
+
+    # Map outputs
+    for i in range(min(n_outputs, len(current_vars))):
+        solver.add(Y_out[i] == current_vars[i])
+
+    # Output constraints (VNNLIB unsafe region)
+    for c in output_constraints:
+        _add_z3_constraint(solver, c, Y_out)
+
+    # Solve
+    result = solver.check()
+
+    if result == z3.sat:
+        m = solver.model()
+        cex_in = [_z3_to_float(m.evaluate(X[i], True)) for i in range(n_inputs)]
+        cex_out = [_z3_to_float(m.evaluate(Y_out[i], True)) for i in range(n_outputs)]
+        return "violated", cex_in, cex_out
+    elif result == z3.unsat:
+        return "verified", None, None
+    else:
+        return "unknown", None, None
+
+
+# ------------------------------------------------------------------
+# Portfolio parallel sub-problem worker (for ProcessPoolExecutor)
+# ------------------------------------------------------------------
+
+def _solve_subproblem(args) -> Tuple[str, Optional[List], Optional[List]]:
+    """Worker function for multi-process portfolio solving."""
+    (onnx_path, n_inputs, n_outputs, input_lb, input_ub,
+     output_constraints, stable_neurons, fixed_phases,
+     threads_per_worker, timeout_ms) = args
+
+    layers = _extract_weights_from_onnx(onnx_path)
+    return _build_z3_formula(
+        layers, n_inputs, n_outputs, input_lb, input_ub,
+        output_constraints, stable_neurons, fixed_phases,
+        threads_per_worker, timeout_ms,
+    )
+
+
+# ------------------------------------------------------------------
+# Main entry point
+# ------------------------------------------------------------------
+
 def verify_with_z3(
     onnx_path: str,
     property,  # VNNLIBProperty
     timeout: float = 300.0,
     input_shape: Optional[Tuple] = None,
+    n_workers: int = 0,
+    threads_per_worker: int = 0,
 ) -> Dict:
     """
-    Verify a neural network property using Z3.
+    Verify a neural network property using Z3 with multi-core support.
+
+    Parallelism:
+      - n_workers=0 (default): auto-detect CPU cores.
+      - n_workers=1: single-process, Z3 internal parallelism only.
+      - n_workers>1: multi-process portfolio with domain splitting.
 
     Args:
         onnx_path: Path to the ONNX model file.
         property: Parsed VNNLIBProperty.
-        timeout: Z3 solver timeout in seconds.
+        timeout: Overall timeout in seconds.
         input_shape: Optional input tensor shape.
-
-    Returns:
-        Dict with 'result' ("verified"/"violated"/"unknown"),
-        'time_seconds', 'details'.
+        n_workers: Number of parallel worker processes (0=auto).
+        threads_per_worker: Z3 internal threads per worker (0=auto).
     """
-    import z3
-
     t0 = time.time()
+
+    total_cores = os.cpu_count() or 4
+
+    # Default: single process, Z3 internal parallel using all cores.
+    # Multi-process portfolio only when explicitly requested (n_workers > 1).
+    if n_workers <= 0:
+        n_workers = 1  # single process, Z3 handles parallelism internally
+    if threads_per_worker <= 0:
+        threads_per_worker = total_cores
 
     layers = _extract_weights_from_onnx(onnx_path)
     linear_layers = [l for l in layers if l["type"] == "linear"]
@@ -135,133 +358,135 @@ def verify_with_z3(
     n_inputs = property.n_inputs
     n_outputs = property.n_outputs
 
-    logger.info(f"Z3 encoding: {n_inputs} inputs, {n_outputs} outputs, "
-                f"{len(linear_layers)} linear layers")
+    # IBP: identify stable neurons
+    lb = property.input_lower.copy()
+    ub = property.input_upper.copy()
+    lb = np.where(np.isfinite(lb), lb, -1e6)
+    ub = np.where(np.isfinite(ub), ub, 1e6)
 
-    # Create Z3 real variables for inputs
-    X = [z3.Real(f"X_{i}") for i in range(n_inputs)]
-    Y_output = [z3.Real(f"Y_{i}") for i in range(n_outputs)]
+    stable = _ibp_stable_neurons(layers, lb, ub)
+    n_stable = sum(1 for s in stable.values() if s != "unstable")
+    n_unstable = sum(1 for s in stable.values() if s == "unstable")
+    n_total = len(stable)
 
-    solver = z3.Solver()
-    solver.set("timeout", int(timeout * 1000))
+    logger.info(
+        f"Z3 parallel: {n_workers} workers × {threads_per_worker} threads | "
+        f"ReLU: {n_total} total, {n_stable} stable, {n_unstable} unstable"
+    )
 
-    # Input bounds
-    lb = property.input_lower
-    ub = property.input_upper
-    for i in range(n_inputs):
-        if np.isfinite(lb[i]):
-            solver.add(X[i] >= float(lb[i]))
-        if np.isfinite(ub[i]):
-            solver.add(X[i] <= float(ub[i]))
+    timeout_ms = int(timeout * 1000)
+    output_constraints = property.output_constraints
 
-    # Encode network layer by layer
-    current_vars = X
-    relu_count = 0
-    layer_idx = 0
+    # --- Single process with Z3 internal parallelism ---
+    # This is the default and most efficient path: Z3's built-in parallel
+    # mode uses all available cores via its internal thread pool.
+    if n_workers == 1 or n_unstable <= 10:
+        status, cex_in, cex_out = _build_z3_formula(
+            layers, n_inputs, n_outputs, lb, ub,
+            output_constraints, stable, None,
+            total_cores, timeout_ms,
+        )
+        return _make_result(status, cex_in, cex_out, time.time() - t0, n_unstable, total_cores)
 
-    for layer in layers:
-        if layer["type"] == "linear":
-            W = layer["W"]
-            b = layer["b"]
-            n_out, n_in = W.shape
+    # --- Multi-process portfolio: split by fixing unstable neuron phases ---
+    unstable_keys = [k for k, v in stable.items() if v == "unstable"]
 
-            # Truncate / pad input dimension
-            in_vars = current_vars[:n_in]
-            if len(in_vars) < n_in:
-                in_vars = in_vars + [z3.RealVal(0)] * (n_in - len(in_vars))
+    # Pick the first few unstable neurons to split on
+    n_split = min(int(np.log2(n_workers)) + 1, len(unstable_keys), 8)
+    split_keys = unstable_keys[:n_split]
+    n_subproblems = 2 ** n_split
 
-            out_vars = []
-            for j in range(n_out):
-                name = f"h_{layer_idx}_{j}"
-                h = z3.Real(name)
-                # h = W[j,:] @ in_vars + b[j]
-                expr = z3.RealVal(float(b[j]))
-                for k in range(n_in):
-                    w_val = float(W[j, k])
-                    if abs(w_val) > 1e-15:
-                        expr = expr + z3.RealVal(w_val) * in_vars[k]
-                solver.add(h == expr)
-                out_vars.append(h)
+    logger.info(f"Portfolio: splitting on {n_split} neurons → {n_subproblems} sub-problems")
 
-            current_vars = out_vars
-            layer_idx += 1
+    sub_timeout_ms = int((timeout - (time.time() - t0)) * 1000)
+    if sub_timeout_ms <= 0:
+        return {"result": "unknown", "time_seconds": time.time() - t0,
+                "details": "Timeout before solving"}
 
-        elif layer["type"] == "relu":
-            relu_vars = []
-            for j, v in enumerate(current_vars):
-                name = f"r_{relu_count}_{j}"
-                r = z3.Real(name)
-                solver.add(r == z3.If(v >= 0, v, z3.RealVal(0)))
-                relu_vars.append(r)
-                relu_count += 1
-            current_vars = relu_vars
+    tasks = []
+    for combo in range(n_subproblems):
+        fixed = {}
+        for bit_idx, key in enumerate(split_keys):
+            fixed[key] = bool((combo >> bit_idx) & 1)
+        tasks.append((
+            onnx_path, n_inputs, n_outputs, lb, ub,
+            output_constraints, stable, fixed,
+            threads_per_worker, sub_timeout_ms,
+        ))
 
-        elif layer["type"] == "flatten":
-            pass
+    # Execute in parallel
+    any_violated = False
+    all_verified = True
+    cex_in_result = None
+    cex_out_result = None
+    n_verified = 0
+    n_unknown = 0
 
-        elif layer["type"] == "add_bias":
-            b = layer["b"]
-            for j in range(min(len(current_vars), len(b))):
-                name = f"ab_{layer_idx}_{j}"
-                h = z3.Real(name)
-                solver.add(h == current_vars[j] + z3.RealVal(float(b[j])))
-                current_vars[j] = h
-            layer_idx += 1
+    ctx = multiprocessing.get_context("spawn")
+    pool_workers = min(n_workers, n_subproblems)
 
-    # Map network outputs to Y variables
-    for i in range(min(n_outputs, len(current_vars))):
-        solver.add(Y_output[i] == current_vars[i])
+    with ProcessPoolExecutor(max_workers=pool_workers, mp_context=ctx) as pool:
+        futures = {pool.submit(_solve_subproblem, t): i for i, t in enumerate(tasks)}
 
-    # Add output constraints (VNNLIB: describes unsafe region)
-    for c in property.output_constraints:
-        _add_z3_constraint(solver, c, Y_output)
+        remaining_timeout = timeout - (time.time() - t0) + 2
+        for future in as_completed(futures, timeout=max(remaining_timeout, 1)):
+            try:
+                status, cex_in, cex_out = future.result(timeout=5)
+            except Exception as e:
+                logger.warning(f"Sub-problem failed: {e}")
+                all_verified = False
+                n_unknown += 1
+                continue
 
-    # Solve
-    logger.info(f"Z3 solving ({solver.num_scopes()} scopes, "
-                f"{len(linear_layers)} linear layers, {relu_count} ReLU neurons)...")
+            if status == "violated":
+                any_violated = True
+                cex_in_result = cex_in
+                cex_out_result = cex_out
+                for f in futures:
+                    f.cancel()
+                break
+            elif status == "verified":
+                n_verified += 1
+            else:
+                all_verified = False
+                n_unknown += 1
 
-    check_result = solver.check()
     elapsed = time.time() - t0
 
-    if check_result == z3.sat:
-        # Unsafe region is reachable → property VIOLATED
-        model = solver.model()
-        cex_input = []
-        for i in range(n_inputs):
-            val = model.evaluate(X[i], model_completion=True)
-            cex_input.append(_z3_to_float(val))
-        cex_output = []
-        for i in range(n_outputs):
-            val = model.evaluate(Y_output[i], model_completion=True)
-            cex_output.append(_z3_to_float(val))
+    if any_violated:
+        return _make_result("violated", cex_in_result, cex_out_result, elapsed, n_unstable, n_workers)
 
-        return {
-            "result": "violated",
-            "time_seconds": elapsed,
-            "details": "Z3 found counterexample (unsafe region reachable)",
-            "counterexample_input": cex_input,
-            "counterexample_output": cex_output,
-        }
+    if all_verified and n_verified == n_subproblems:
+        return _make_result("verified", None, None, elapsed, n_unstable, n_workers)
 
-    elif check_result == z3.unsat:
-        return {
-            "result": "verified",
-            "time_seconds": elapsed,
-            "details": "Z3 proved UNSAT (unsafe region unreachable — exact proof)",
-        }
+    return _make_result("unknown", None, None, elapsed, n_unstable, n_workers,
+                        extra=f"{n_verified}/{n_subproblems} sub-problems verified, {n_unknown} unknown")
 
-    else:
-        return {
-            "result": "unknown",
-            "time_seconds": elapsed,
-            "details": f"Z3 returned {check_result} (likely timeout)",
-        }
 
+def _make_result(status, cex_in, cex_out, elapsed, n_unstable, n_workers, extra=""):
+    details_map = {
+        "verified": f"Z3 proved UNSAT — exact proof ({n_unstable} unstable ReLUs, {n_workers} workers)",
+        "violated": f"Z3 found counterexample ({n_workers} workers)",
+        "unknown": f"Z3 timeout/unknown ({n_unstable} unstable ReLUs, {n_workers} workers)",
+    }
+    details = details_map.get(status, status)
+    if extra:
+        details += f" | {extra}"
+
+    result = {"result": status, "time_seconds": elapsed, "details": details}
+    if cex_in is not None:
+        result["counterexample_input"] = cex_in
+    if cex_out is not None:
+        result["counterexample_output"] = cex_out
+    return result
+
+
+# ------------------------------------------------------------------
+# Z3 constraint helpers
+# ------------------------------------------------------------------
 
 def _add_z3_constraint(solver, constraint: Dict, Y: list):
-    """Add a VNNLIB output constraint to the Z3 solver."""
     import z3
-
     ctype = constraint["type"]
 
     if ctype == "output_bound":
@@ -308,7 +533,6 @@ def _add_z3_constraint(solver, constraint: Dict, Y: list):
 
 
 def _z3_to_float(val) -> float:
-    """Convert a Z3 value to Python float."""
     import z3
     try:
         if z3.is_rational_value(val):
