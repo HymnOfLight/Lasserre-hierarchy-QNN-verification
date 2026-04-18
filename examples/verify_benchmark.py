@@ -21,6 +21,9 @@ Usage:
     # Verify instances 0-9
     python verify_benchmark.py --benchmark acasxu --instances 0-9
 
+    # Verify with Z3 (exact SMT solver, slower but complete)
+    python verify_benchmark.py --benchmark acasxu --instances 0-4 --solver z3
+
     # Verify all instances of a benchmark
     python verify_benchmark.py --benchmark linearizenn --all
 """
@@ -64,7 +67,8 @@ def print_benchmarks():
           f"Complex: {sum(1 for b in BENCHMARKS.values() if b.category == 'complex')})")
 
 
-def run_verification(benchmark_name: str, indices: list, timeout: float = None):
+def run_verification(benchmark_name: str, indices: list, timeout: float = None,
+                     solver: str = "jacobian"):
     """Download, load, and verify benchmark instances."""
     try:
         bench_dir = download_benchmark(benchmark_name, skip_large=False)
@@ -78,8 +82,9 @@ def run_verification(benchmark_name: str, indices: list, timeout: float = None):
     if not indices:
         indices = list(range(len(all_inst)))
 
+    solver_label = {"jacobian": "Jacobian bounds", "z3": "Z3 SMT", "sdp": "Lasserre SDP"}.get(solver, solver)
     print(f"\n{'='*76}")
-    print(f"  Verifying: {info.name}  ({len(indices)} instances)")
+    print(f"  Verifying: {info.name}  ({len(indices)} instances, solver={solver_label})")
     print(f"{'='*76}")
 
     results_summary = {"verified": 0, "violated": 0, "unknown": 0, "error": 0, "timeout": 0}
@@ -92,7 +97,7 @@ def run_verification(benchmark_name: str, indices: list, timeout: float = None):
 
         try:
             inst = load_benchmark_instance(benchmark_name, idx)
-            res = verify_instance(inst, timeout=timeout)
+            res = verify_instance(inst, timeout=timeout, method=solver)
             results_summary[res.result] = results_summary.get(res.result, 0) + 1
             total_time += res.time_seconds
             print(f"  [{idx:3d}] {res}")
@@ -122,6 +127,9 @@ def main():
                         help="Range e.g. '0-9'")
     parser.add_argument("--all", action="store_true",
                         help="Verify all instances")
+    parser.add_argument("--solver", type=str, default="jacobian",
+                        choices=["jacobian", "z3", "sdp"],
+                        help="Solver: jacobian (fast), z3 (exact SMT), sdp (Lasserre)")
     parser.add_argument("--timeout", type=float, default=None)
     parser.add_argument("--list-instances", type=str, default=None)
     args = parser.parse_args()
@@ -161,7 +169,7 @@ def main():
             indices = [args.instance]
         else:
             indices = [0]
-        run_verification(args.benchmark, indices, args.timeout)
+        run_verification(args.benchmark, indices, args.timeout, args.solver)
         return
 
     print_benchmarks()

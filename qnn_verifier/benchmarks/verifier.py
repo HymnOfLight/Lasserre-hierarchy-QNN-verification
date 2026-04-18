@@ -59,11 +59,14 @@ def verify_instance(
     Args:
         instance: BenchmarkInstance with model and property loaded.
         timeout: Override the instance timeout (seconds).
-        method: "jacobian" (fast) or "sdp" (Lasserre SDP refinement).
+        method: "jacobian" (fast), "z3" (exact SMT), or "sdp" (Lasserre).
 
     Returns:
         BenchmarkVerificationResult.
     """
+    if method == "z3":
+        return _verify_with_z3_wrapper(instance, timeout)
+
     from pathlib import Path
     t0 = time.time()
     max_time = timeout or instance.timeout
@@ -453,3 +456,49 @@ def _check_constraint_point(
         return False, -np.inf
 
     return False, -np.inf
+
+
+# ------------------------------------------------------------------
+# Z3 solver wrapper
+# ------------------------------------------------------------------
+
+def _verify_with_z3_wrapper(
+    instance: BenchmarkInstance,
+    timeout: Optional[float] = None,
+) -> BenchmarkVerificationResult:
+    """Dispatch verification to the Z3-based exact solver."""
+    from pathlib import Path
+    from .z3_solver import verify_with_z3
+
+    res = BenchmarkVerificationResult(
+        benchmark=instance.benchmark_name,
+        model_name=Path(instance.model_path).stem,
+        property_name=Path(instance.property_path).stem,
+    )
+
+    if instance.property is None:
+        res.result = "error"
+        res.details = "Property not loaded"
+        return res
+    if not Path(instance.model_path).exists():
+        res.result = "error"
+        res.details = "Model file not found"
+        return res
+
+    max_time = timeout or instance.timeout or 300.0
+    z3_result = verify_with_z3(
+        onnx_path=instance.model_path,
+        property=instance.property,
+        timeout=max_time,
+        input_shape=instance.input_shape,
+    )
+
+    res.result = z3_result["result"]
+    res.time_seconds = z3_result["time_seconds"]
+    res.method = "z3"
+    res.details = z3_result.get("details", "")
+
+    if "counterexample_input" in z3_result:
+        res.details += f" | CEX input: {z3_result['counterexample_input'][:5]}"
+
+    return res
