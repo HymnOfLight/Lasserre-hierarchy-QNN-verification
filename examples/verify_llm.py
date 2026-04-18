@@ -6,23 +6,31 @@ Verifies that the next-token prediction is stable under L_inf
 embedding-space perturbation, using Jacobian-based bounding with
 optional Lasserre hierarchy SDP refinement (SCS solver).
 
+Models are downloaded from ModelScope (国内镜像, 默认) to ./models/ 目录.
+
 Usage:
-    # Quick demo with Qwen2-0.5B (CPU, ~1GB RAM)
+    # 默认使用 ModelScope 下载 Qwen2-0.5B 到 ./models/
     python verify_llm.py
 
-    # Qwen2-7B on GPU (needs ~16GB VRAM in fp16)
+    # Qwen2-7B (GPU fp16, ~16GB 显存)
     python verify_llm.py --model Qwen/Qwen2-7B --device cuda
 
-    # Qwen2-7B int8 quantised (~8GB VRAM)
+    # Qwen2-7B int8 量化 (~8GB 显存)
     python verify_llm.py --model Qwen/Qwen2-7B --quantization int8
 
-    # Qwen2-7B int4 quantised (~4GB VRAM)
+    # Qwen2-7B int4 量化 (~4GB 显存)
     python verify_llm.py --model Qwen/Qwen2-7B --quantization int4
 
-    # Custom prompt and epsilon
+    # 使用 HuggingFace 镜像 (海外)
+    python verify_llm.py --mirror huggingface
+
+    # 指定本地已下载的模型目录
+    python verify_llm.py --model ./models/qwen/Qwen2-0.5B
+
+    # 自定义 prompt 和 epsilon
     python verify_llm.py --prompt "The capital of France is" --epsilon 0.001
 
-    # Find the maximum certifiable radius (binary search)
+    # 搜索最大可认证扰动半径
     python verify_llm.py --find-radius --prompt "2 + 2 ="
 """
 
@@ -58,7 +66,12 @@ DEFAULT_EPSILONS = [1e-4, 5e-4, 1e-3, 5e-3, 1e-2]
 def main():
     parser = argparse.ArgumentParser(description="LLM robustness verification")
     parser.add_argument("--model", type=str, default="Qwen/Qwen2-0.5B",
-                        help="HuggingFace model name or path")
+                        help="Model name or local path (e.g. Qwen/Qwen2-7B)")
+    parser.add_argument("--mirror", type=str, default="modelscope",
+                        choices=["modelscope", "huggingface"],
+                        help="Download source: modelscope (国内默认) / huggingface")
+    parser.add_argument("--cache-dir", type=str, default=None,
+                        help="Model cache directory (default: ./models/)")
     parser.add_argument("--quantization", type=str, default=None,
                         choices=[None, "int8", "int4", "fp16", "fp32"],
                         help="Quantisation mode")
@@ -73,12 +86,14 @@ def main():
     parser.add_argument("--find-radius", action="store_true",
                         help="Binary-search for max certifiable radius")
     parser.add_argument("--use-sdp", action="store_true",
-                        help="Enable Lasserre SDP refinement (slow for large hidden dims)")
+                        help="Enable Lasserre SDP refinement")
     args = parser.parse_args()
 
     # ---- Load model ----
     print("=" * 64)
-    print(f"  Loading: {args.model}")
+    print(f"  Model       : {args.model}")
+    print(f"  Mirror      : {args.mirror}")
+    print(f"  Cache dir   : {args.cache_dir or './models/ (default)'}")
     print(f"  Quantisation: {args.quantization or 'auto'}")
     print("=" * 64)
 
@@ -86,6 +101,8 @@ def main():
         model_name=args.model,
         quantization=args.quantization,
         device=args.device,
+        mirror=args.mirror,
+        cache_dir=args.cache_dir,
     )
 
     print(f"  Model       : {llm.model_name}")
