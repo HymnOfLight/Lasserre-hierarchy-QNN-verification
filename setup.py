@@ -20,6 +20,8 @@ setup(
         "onnx>=1.14.0",
         "onnxruntime>=1.16.0",
         "z3-solver>=4.12.0",
+        "cvc5>=1.1.0",
+        "bitwuzla>=0.4.0",
         "sympy>=1.12",
         "networkx>=3.0",
         "matplotlib>=3.7.0",
