@@ -13,6 +13,7 @@ from .registry import BENCHMARKS, BenchmarkInfo, list_benchmarks
 from .downloader import download_benchmark, download_all
 from .loader import load_benchmark_instance, load_onnx_model
 from .vnnlib_parser import parse_vnnlib
+from .verifier import verify_instance, BenchmarkVerificationResult
 
 __all__ = [
     "BENCHMARKS",
@@ -23,4 +24,6 @@ __all__ = [
     "load_benchmark_instance",
     "load_onnx_model",
     "parse_vnnlib",
+    "verify_instance",
+    "BenchmarkVerificationResult",
 ]

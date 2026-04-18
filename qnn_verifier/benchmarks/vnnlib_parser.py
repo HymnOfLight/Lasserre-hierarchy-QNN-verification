@@ -4,13 +4,11 @@ VNNLIB property file parser.
 Parses the VNN-LIB format used by VNN-COMP to specify input/output
 constraints for neural network verification properties.
 
-VNNLIB format (simplified SMT-LIB2 subset):
-  (declare-const X_0 Real)
-  ...
-  (assert (<= X_0 0.5))
-  (assert (>= X_0 -0.5))
-  ...
-  (assert (or (and (<= Y_0 Y_1)) ...))
+Supported constraint patterns:
+  - Input bounds:    (assert (<= X_0 0.5))  /  (assert (>= X_0 -0.5))
+  - Output bound:    (assert (>= Y_0 3.99))
+  - Output compare:  (assert (<= Y_1 Y_0))
+  - Disjunction:     (assert (or (and ...) (and ...)))
 """
 
 import re
@@ -31,108 +29,185 @@ class VNNLIBProperty:
     n_outputs: int = 0
     input_lower: Optional[np.ndarray] = None
     input_upper: Optional[np.ndarray] = None
-    # Output constraints: list of disjunctive clauses
-    # Each clause is a list of (var_idx, op, bound) or (var_i, op, var_j, offset)
     output_constraints: List = field(default_factory=list)
     raw_text: str = ""
 
+    def describe(self) -> str:
+        """Human-readable description of the property."""
+        parts = [f"Inputs: {self.n_inputs}, Outputs: {self.n_outputs}"]
+        if self.input_lower is not None:
+            bounded = np.isfinite(self.input_lower).sum()
+            parts.append(f"Input bounds: {bounded}/{self.n_inputs} bounded")
+        for c in self.output_constraints:
+            if c["type"] == "output_bound":
+                parts.append(f"  Y_{c['var']} {c['op']} {c['bound']:.6f}")
+            elif c["type"] == "comparison":
+                parts.append(f"  Y_{c['left']} {c['op']} Y_{c['right']}")
+            elif c["type"] == "disjunction":
+                parts.append(f"  OR of {len(c['clauses'])} conjunctive clauses")
+        return "\n".join(parts)
+
+
+_NUM = r"([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)"
+
 
 def parse_vnnlib(filepath: str) -> VNNLIBProperty:
-    """
-    Parse a VNNLIB property file.
-
-    Returns a VNNLIBProperty with input bounds and output constraints.
-    """
+    """Parse a VNNLIB property file."""
     path = Path(filepath)
     if not path.exists():
         raise FileNotFoundError(f"VNNLIB file not found: {filepath}")
 
     text = path.read_text()
+    # Strip comments
+    lines = [l for l in text.split("\n") if not l.strip().startswith(";")]
+    clean = "\n".join(lines)
+
     prop = VNNLIBProperty(raw_text=text)
 
-    # Extract variable declarations
     input_vars = re.findall(r"\(declare-const\s+(X_\d+)\s+Real\)", text)
     output_vars = re.findall(r"\(declare-const\s+(Y_\d+)\s+Real\)", text)
     prop.n_inputs = len(input_vars)
     prop.n_outputs = len(output_vars)
 
-    # Parse input bounds from assert statements
     input_lower = np.full(prop.n_inputs, -np.inf)
     input_upper = np.full(prop.n_inputs, np.inf)
 
-    # Match: (assert (>= X_i val)) or (assert (<= X_i val))
-    for match in re.finditer(
-        r"\(assert\s+\((>=|<=)\s+X_(\d+)\s+([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)\s*\)\s*\)",
-        text,
+    # -- Input bounds: (assert (OP X_i val)) --
+    for m in re.finditer(
+        r"\(assert\s*\(\s*(>=|<=)\s+X_(\d+)\s+" + _NUM + r"\s*\)\s*\)", clean
     ):
-        op, idx_str, val_str = match.groups()
-        idx = int(idx_str)
-        val = float(val_str)
+        op, idx, val = m.group(1), int(m.group(2)), float(m.group(3))
         if idx < prop.n_inputs:
             if op == ">=":
                 input_lower[idx] = max(input_lower[idx], val)
             else:
                 input_upper[idx] = min(input_upper[idx], val)
 
-    # Also match flipped: (assert (<= val X_i)) means X_i >= val
-    for match in re.finditer(
-        r"\(assert\s+\((>=|<=)\s+([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)\s+X_(\d+)\s*\)\s*\)",
-        text,
+    # Flipped: (assert (OP val X_i))
+    for m in re.finditer(
+        r"\(assert\s*\(\s*(>=|<=)\s+" + _NUM + r"\s+X_(\d+)\s*\)\s*\)", clean
     ):
-        op, val_str, idx_str = match.groups()
-        idx = int(idx_str)
-        val = float(val_str)
+        op, val, idx = m.group(1), float(m.group(2)), int(m.group(3))
         if idx < prop.n_inputs:
-            if op == "<=":  # val <= X_i  means  X_i >= val
+            if op == "<=":
                 input_lower[idx] = max(input_lower[idx], val)
-            else:  # val >= X_i  means  X_i <= val
+            else:
                 input_upper[idx] = min(input_upper[idx], val)
 
     prop.input_lower = input_lower
     prop.input_upper = input_upper
 
-    # Parse output constraints (simplified: extract the assert/or/and structure)
-    output_constraints = []
-
-    # Simple case: (assert (<= Y_i Y_j)) meaning Y_i <= Y_j
-    for match in re.finditer(
-        r"\(assert\s+\((<=|>=)\s+Y_(\d+)\s+Y_(\d+)\s*\)\s*\)", text
+    # -- Output bound on single variable: (assert (OP Y_i val)) --
+    for m in re.finditer(
+        r"\(assert\s*\(\s*(>=|<=)\s+Y_(\d+)\s+" + _NUM + r"\s*\)\s*\)", clean
     ):
-        op, i_str, j_str = match.groups()
-        output_constraints.append({
-            "type": "comparison",
-            "op": op,
-            "left": int(i_str),
-            "right": int(j_str),
+        prop.output_constraints.append({
+            "type": "output_bound",
+            "var": int(m.group(2)),
+            "op": m.group(1),
+            "bound": float(m.group(3)),
         })
 
-    # Disjunctive: (assert (or (and ...) (and ...)))
-    or_blocks = re.findall(r"\(assert\s+\(or\s+(.*?)\)\s*\)\s*$", text, re.DOTALL | re.MULTILINE)
-    for block in or_blocks:
+    # -- Comparison between two output vars: (assert (OP Y_i Y_j)) --
+    for m in re.finditer(
+        r"\(assert\s*\(\s*(>=|<=)\s+Y_(\d+)\s+Y_(\d+)\s*\)\s*\)", clean
+    ):
+        prop.output_constraints.append({
+            "type": "comparison",
+            "op": m.group(1),
+            "left": int(m.group(2)),
+            "right": int(m.group(3)),
+        })
+
+    # -- Disjunction: (assert (or ...)) --
+    # Use a balanced-paren approach to find the full (assert (or ...)) block
+    _parse_disjunctions(clean, prop)
+
+    return prop
+
+
+def _parse_disjunctions(text: str, prop: VNNLIBProperty):
+    """Parse (assert (or ...)) blocks using balanced parenthesis matching."""
+    idx = 0
+    while True:
+        pos = text.find("(assert", idx)
+        if pos == -1:
+            break
+        # Check if this is an (assert (or ...))
+        inner_start = text.find("(", pos + 7)
+        if inner_start == -1:
+            break
+        # Skip whitespace
+        rest = text[inner_start:].lstrip()
+        if not rest.startswith("(or"):
+            idx = pos + 7
+            continue
+
+        # Find matching closing paren for the outer (assert ...)
+        depth = 0
+        end = pos
+        for i in range(pos, len(text)):
+            if text[i] == "(":
+                depth += 1
+            elif text[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+
+        block = text[pos:end]
+        idx = end
+
+        # Extract the content inside (or ...)
+        or_start = block.find("(or")
+        if or_start == -1:
+            continue
+        or_content = block[or_start + 3:]
+        # Remove trailing ))
+        or_content = or_content.rstrip().rstrip(")")
+
         clauses = []
-        and_blocks = re.findall(r"\(and\s+(.*?)\)", block, re.DOTALL)
-        for and_block in and_blocks:
-            clause = []
-            for cmp in re.finditer(
-                r"\((<=|>=)\s+Y_(\d+)\s+Y_(\d+)\)", and_block
-            ):
-                clause.append({
-                    "op": cmp.group(1),
-                    "left": int(cmp.group(2)),
-                    "right": int(cmp.group(3)),
-                })
-            for cmp in re.finditer(
-                r"\((<=|>=)\s+Y_(\d+)\s+([-+]?[\d.eE+-]+)\)", and_block
-            ):
-                clause.append({
-                    "op": cmp.group(1),
-                    "left": int(cmp.group(2)),
-                    "bound": float(cmp.group(3)),
-                })
+        for and_m in re.finditer(r"\(and\s+(.*?)\)", or_content, re.DOTALL):
+            clause = _parse_clause(and_m.group(1))
             if clause:
                 clauses.append(clause)
-        if clauses:
-            output_constraints.append({"type": "disjunction", "clauses": clauses})
 
-    prop.output_constraints = output_constraints
-    return prop
+        # Handle single-atom clauses without (and ...) wrapper
+        if not clauses:
+            # Each top-level (...) inside or is a single-atom clause
+            for atom_m in re.finditer(r"\(\s*(>=|<=)\s+Y_(\d+)\s+" + _NUM + r"\s*\)", or_content):
+                clauses.append([{
+                    "op": atom_m.group(1),
+                    "var": int(atom_m.group(2)),
+                    "bound": float(atom_m.group(3)),
+                }])
+            for atom_m in re.finditer(r"\(\s*(>=|<=)\s+Y_(\d+)\s+Y_(\d+)\s*\)", or_content):
+                clauses.append([{
+                    "op": atom_m.group(1),
+                    "left": int(atom_m.group(2)),
+                    "right": int(atom_m.group(3)),
+                }])
+
+        if clauses:
+            prop.output_constraints.append({
+                "type": "disjunction",
+                "clauses": clauses,
+            })
+
+
+def _parse_clause(text: str) -> List[Dict]:
+    """Parse atomic constraints inside a conjunctive clause."""
+    atoms = []
+    # Y_i OP Y_j
+    for m in re.finditer(r"\(\s*(>=|<=)\s+Y_(\d+)\s+Y_(\d+)\s*\)", text):
+        atoms.append({
+            "op": m.group(1), "left": int(m.group(2)), "right": int(m.group(3)),
+        })
+    # Y_i OP val
+    for m in re.finditer(
+        r"\(\s*(>=|<=)\s+Y_(\d+)\s+" + _NUM + r"\s*\)", text
+    ):
+        atoms.append({
+            "op": m.group(1), "var": int(m.group(2)), "bound": float(m.group(3)),
+        })
+    return atoms
