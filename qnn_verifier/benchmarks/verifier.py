@@ -532,39 +532,32 @@ def _verify_with_smt_portfolio(
     )
 
     if instance.property is None:
-        res.result = "error"
-        res.details = "Property not loaded"
+        res.result, res.details = "error", "Property not loaded"
         return res
     if not Path(instance.model_path).exists():
-        res.result = "error"
-        res.details = "Model file not found"
+        res.result, res.details = "error", "Model file not found"
         return res
 
     max_time = timeout or instance.timeout or 300.0
-
-    # Map method name to solver list
-    if method in ("smt", "portfolio"):
-        solvers = None  # auto-detect all
-    elif method == "cvc5":
-        solvers = ["cvc5"]
-    elif method == "bitwuzla":
-        solvers = ["bitwuzla"]
-    elif method == "opensmt":
-        solvers = ["opensmt"]
-    else:
-        solvers = None
+    solver_map = {
+        "smt": None, "portfolio": None,
+        "cvc5": ["cvc5"], "bitwuzla": ["bitwuzla"], "opensmt": ["opensmt"],
+    }
+    solvers = solver_map.get(method)
 
     smt_result = verify_with_smt(
         onnx_path=instance.model_path,
         property=instance.property,
         timeout=max_time,
         solvers=solvers,
-        n_threads=threads_per_worker,
+        total_cores=n_workers or 0,
+        save_formula=True,
+        benchmark_name=instance.benchmark_name,
+        instance_name=Path(instance.property_path).stem,
     )
 
     res.result = smt_result["result"]
     res.time_seconds = smt_result["time_seconds"]
     res.method = smt_result.get("solver", method)
     res.details = smt_result.get("details", "")
-
     return res

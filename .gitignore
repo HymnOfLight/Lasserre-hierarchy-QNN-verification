@@ -10,3 +10,4 @@ build/
 !setup.py
 models/
 benchmarks_data/
+smt_formulas/
