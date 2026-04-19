@@ -177,15 +177,16 @@ def verify_with_gurobi(
             r = model.addMVar(n, lb=0.0, ub=relu_out_ub, name=f"r_{relu_layer_idx}")
 
             for j in range(n):
+                # Use symbolic rewrite stable info first, then IBP
+                key = (relu_layer_idx, j)
+                rw_status = stable_from_rewrite.get(key, None)
                 lb_j = float(pre_lb[j])
                 ub_j = float(pre_ub[j])
 
-                if lb_j >= 0:
-                    # Active: r = x
+                if rw_status == "active" or lb_j >= 0:
                     model.addConstr(r[j] == current_vars[j],
                                     name=f"relu_{relu_layer_idx}_{j}_active")
-                elif ub_j <= 0:
-                    # Inactive: r = 0
+                elif rw_status == "inactive" or ub_j <= 0:
                     model.addConstr(r[j] == 0,
                                     name=f"relu_{relu_layer_idx}_{j}_inactive")
                 else:
