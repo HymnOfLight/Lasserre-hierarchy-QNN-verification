@@ -30,6 +30,21 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_SMT_DIR = _PROJECT_ROOT / "smt_formulas"
 
 
+def _fmt(v: float) -> str:
+    """Format a float as an SMT-LIB2-compatible decimal literal.
+    SMT-LIB2 does NOT support scientific notation (1.5e-01).
+    Negative numbers use the (- x) form."""
+    if v == 0.0:
+        return "0.0"
+    neg = v < 0
+    s = f"{abs(v):.18f}"
+    if "." in s:
+        s = s.rstrip("0")
+        if s.endswith("."):
+            s += "0"
+    return f"(- {s})" if neg else s
+
+
 # ------------------------------------------------------------------
 # ONNX weight extraction + IBP
 # ------------------------------------------------------------------
@@ -106,9 +121,9 @@ def generate_smtlib2(layers, n_inputs, n_outputs, input_lb, input_ub,
     lines.append("")
     for i in range(n_inputs):
         if np.isfinite(input_lb[i]):
-            lines.append(f"(assert (>= X_{i} {input_lb[i]:.15e}))")
+            lines.append(f"(assert (>= X_{i} {_fmt(input_lb[i])}))")
         if np.isfinite(input_ub[i]):
-            lines.append(f"(assert (<= X_{i} {input_ub[i]:.15e}))")
+            lines.append(f"(assert (<= X_{i} {_fmt(input_ub[i])}))")
     lines.append("")
 
     current = [f"X_{i}" for i in range(n_inputs)]
@@ -125,9 +140,9 @@ def generate_smtlib2(layers, n_inputs, n_outputs, input_lb, input_ub,
                 lines.append(f"(declare-const {vn} Real)")
                 nz = np.nonzero(np.abs(W[j, :]) > 1e-15)[0]
                 if len(nz) == 0:
-                    lines.append(f"(assert (= {vn} {b[j]:.15e}))")
+                    lines.append(f"(assert (= {vn} {_fmt(b[j])}))")
                 else:
-                    terms = [f"{b[j]:.15e}"] + [f"(* {W[j,k]:.15e} {iv[k]})" for k in nz]
+                    terms = [_fmt(b[j])] + [f"(* {_fmt(W[j,k])} {iv[k]})" for k in nz]
                     lines.append(f"(assert (= {vn} (+ {' '.join(terms)})))")
                 nv.append(vn)
             current = nv
@@ -167,7 +182,7 @@ def generate_smtlib2(layers, n_inputs, n_outputs, input_lb, input_ub,
 def _constraint_to_smtlib2(c):
     t = c["type"]
     if t == "output_bound":
-        return f"(assert ({c['op']} Y_{c['var']} {c['bound']:.15e}))"
+        return f"(assert ({c['op']} Y_{c['var']} {_fmt(c['bound'])}))"
     elif t == "comparison":
         return f"(assert ({c['op']} Y_{c['left']} Y_{c['right']}))"
     elif t == "disjunction":
@@ -178,7 +193,7 @@ def _constraint_to_smtlib2(c):
                 if "right" in a:
                     atoms.append(f"({a['op']} Y_{a['left']} Y_{a['right']})")
                 elif "bound" in a:
-                    atoms.append(f"({a['op']} Y_{a['var']} {a['bound']:.15e})")
+                    atoms.append(f"({a['op']} Y_{a['var']} {_fmt(a['bound'])})")
             if len(atoms) == 1: clauses.append(atoms[0])
             elif atoms: clauses.append(f"(and {' '.join(atoms)})")
         if len(clauses) == 1: return f"(assert {clauses[0]})"
