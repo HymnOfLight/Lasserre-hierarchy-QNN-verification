@@ -70,8 +70,10 @@ def verify_instance(
     """
     if method == "z3":
         return _verify_with_z3_wrapper(instance, timeout, n_workers, threads_per_worker)
-    if method in ("smt", "portfolio", "cvc5", "bitwuzla", "opensmt"):
+    if method in ("smt", "portfolio", "cvc5", "opensmt"):
         return _verify_with_smt_portfolio(instance, timeout, method, n_workers, threads_per_worker)
+    if method == "gurobi":
+        return _verify_with_gurobi(instance, timeout, n_workers)
 
     from pathlib import Path
     t0 = time.time()
@@ -560,4 +562,41 @@ def _verify_with_smt_portfolio(
     res.time_seconds = smt_result["time_seconds"]
     res.method = smt_result.get("solver", method)
     res.details = smt_result.get("details", "")
+    return res
+
+
+def _verify_with_gurobi(
+    instance: BenchmarkInstance,
+    timeout: Optional[float] = None,
+    n_workers: int = 0,
+) -> BenchmarkVerificationResult:
+    """Dispatch to Gurobi MILP solver."""
+    from pathlib import Path
+    from .gurobi_solver import verify_with_gurobi
+
+    res = BenchmarkVerificationResult(
+        benchmark=instance.benchmark_name,
+        model_name=Path(instance.model_path).stem,
+        property_name=Path(instance.property_path).stem,
+    )
+    if instance.property is None:
+        res.result, res.details = "error", "Property not loaded"
+        return res
+    if not Path(instance.model_path).exists():
+        res.result, res.details = "error", "Model file not found"
+        return res
+
+    result = verify_with_gurobi(
+        onnx_path=instance.model_path,
+        property=instance.property,
+        timeout=timeout or instance.timeout or 300.0,
+        total_cores=n_workers or 0,
+        save_lp=True,
+        benchmark_name=instance.benchmark_name,
+        instance_name=Path(instance.property_path).stem,
+    )
+    res.result = result["result"]
+    res.time_seconds = result["time_seconds"]
+    res.method = "gurobi"
+    res.details = result.get("details", "")
     return res

@@ -16,6 +16,7 @@ from .vnnlib_parser import parse_vnnlib
 from .verifier import verify_instance, BenchmarkVerificationResult
 from .z3_solver import verify_with_z3
 from .smt_solver import verify_with_smt
+from .gurobi_solver import verify_with_gurobi, verify_pytorch_with_gurobi
 
 __all__ = [
     "BENCHMARKS",
