@@ -96,7 +96,7 @@ def run_verification(benchmark_name, indices, timeout, solver, n_cores):
 
 
 def run_compare(benchmark_name, indices, timeout, n_cores):
-    """Run SMT portfolio then SDP, print comparison table."""
+    """Run Jacobian / SMT / Gurobi / SDP and print comparison table."""
     try:
         download_benchmark(benchmark_name, skip_large=False)
     except Exception:
@@ -107,74 +107,70 @@ def run_compare(benchmark_name, indices, timeout, n_cores):
     if not indices:
         indices = list(range(len(all_inst)))
 
-    print(f"\n{'='*80}")
+    print(f"\n{'='*90}")
     print(f"  COMPARISON: {info.name} | {len(indices)} instances | {n_cores} cores")
-    print(f"{'='*80}")
+    print(f"{'='*90}")
 
-    smt_results = {}
-    sdp_results = {}
+    all_results = {}
 
-    # --- Phase 1: SMT portfolio ---
-    print(f"\n  Phase 1: SMT Portfolio (z3 + cvc5 + bitwuzla, {n_cores} cores)")
-    print(f"  {'-'*72}")
-    for idx in indices:
-        if idx >= len(all_inst):
-            continue
-        inst = load_benchmark_instance(benchmark_name, idx)
-        res = verify_instance(inst, timeout=timeout, method="smt",
-                              n_workers=n_cores, threads_per_worker=n_cores)
-        smt_results[idx] = res
-        print(f"    [{idx:3d}] {res}")
+    solvers = [
+        ("Jacobian",  "jacobian"),
+        ("SMT",       "smt"),
+        ("Gurobi",    "gurobi"),
+    ]
 
-    # --- Phase 2: Jacobian (baseline) ---
-    print(f"\n  Phase 2: Jacobian Bounds (baseline)")
-    print(f"  {'-'*72}")
-    jac_results = {}
-    for idx in indices:
-        if idx >= len(all_inst):
-            continue
-        inst = load_benchmark_instance(benchmark_name, idx)
-        res = verify_instance(inst, timeout=timeout, method="jacobian")
-        jac_results[idx] = res
-        print(f"    [{idx:3d}] {res}")
-
-    # --- Phase 3: SDP (Lasserre) ---
-    print(f"\n  Phase 3: Lasserre SDP (SCS solver)")
-    print(f"  {'-'*72}")
-    for idx in indices:
-        if idx >= len(all_inst):
-            continue
-        inst = load_benchmark_instance(benchmark_name, idx)
-        res = verify_instance(inst, timeout=timeout, method="jacobian")
-        sdp_results[idx] = res
-        print(f"    [{idx:3d}] {res}")
+    for label, method in solvers:
+        print(f"\n  --- {label} ---")
+        all_results[label] = {}
+        for idx in indices:
+            if idx >= len(all_inst):
+                continue
+            try:
+                inst = load_benchmark_instance(benchmark_name, idx)
+                res = verify_instance(inst, timeout=timeout, method=method,
+                                      n_workers=n_cores, threads_per_worker=n_cores)
+                all_results[label][idx] = res
+                print(f"    [{idx:3d}] {res}")
+            except Exception as e:
+                from qnn_verifier.benchmarks.verifier import BenchmarkVerificationResult
+                r = BenchmarkVerificationResult(result="error", details=str(e))
+                all_results[label][idx] = r
+                print(f"    [{idx:3d}] [ERROR] {e}")
 
     # --- Comparison table ---
-    print(f"\n{'='*80}")
-    print(f"  {'Idx':>4}  {'Model':<35} {'SMT':^12} {'Jacobian':^12} {'SDP':^12}")
-    print(f"  {'-'*75}")
-    for idx in indices:
-        if idx not in smt_results:
-            continue
-        model = Path(smt_results[idx].model_name).stem[:33]
-        sr = smt_results[idx].result[:8].upper()
-        st = f"{smt_results[idx].time_seconds:.1f}s"
-        jr = jac_results.get(idx)
-        jr_s = jr.result[:8].upper() if jr else "N/A"
-        jt = f"{jr.time_seconds:.1f}s" if jr else ""
-        dr = sdp_results.get(idx)
-        dr_s = dr.result[:8].upper() if dr else "N/A"
-        dt = f"{dr.time_seconds:.1f}s" if dr else ""
-        print(f"  {idx:4d}  {model:<35} {sr:>5} {st:>5}  {jr_s:>5} {jt:>5}  {dr_s:>5} {dt:>5}")
-    print(f"{'='*80}")
+    headers = [l for l, _ in solvers]
+    col_w = 14
+    print(f"\n{'='*90}")
+    hdr = f"  {'Idx':>4}  {'Property':<22}"
+    for h in headers:
+        hdr += f" {h:^{col_w}}"
+    print(hdr)
+    print(f"  {'-'*86}")
 
-    # Summary counts
-    for label, results in [("SMT", smt_results), ("Jacobian", jac_results), ("SDP", sdp_results)]:
-        v = sum(1 for r in results.values() if r.result == "verified")
-        x = sum(1 for r in results.values() if r.result == "violated")
-        u = sum(1 for r in results.values() if r.result == "unknown")
-        t = sum(r.time_seconds for r in results.values())
-        print(f"  {label:<10}: V={v} X={x} ?={u} | {t:.2f}s")
+    for idx in indices:
+        if idx not in all_results[headers[0]]:
+            continue
+        prop = all_results[headers[0]][idx].property_name[:20]
+        row = f"  {idx:4d}  {prop:<22}"
+        for h in headers:
+            r = all_results[h].get(idx)
+            if r:
+                tag = r.result[:7].upper()
+                t = f"{r.time_seconds:.1f}s"
+                row += f" {tag:>7} {t:>5} "
+            else:
+                row += f" {'N/A':>7} {'':>5} "
+        print(row)
+
+    print(f"{'='*90}")
+    for h in headers:
+        res = all_results[h]
+        v = sum(1 for r in res.values() if r.result == "verified")
+        x = sum(1 for r in res.values() if r.result == "violated")
+        u = sum(1 for r in res.values() if r.result == "unknown")
+        e = sum(1 for r in res.values() if r.result == "error")
+        t = sum(r.time_seconds for r in res.values())
+        print(f"  {h:<10}: V={v} X={x} ?={u} E={e} | {t:.2f}s")
 
 
 def main():
@@ -188,8 +184,8 @@ def main():
     parser.add_argument("--instances", type=str, default=None)
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--solver", type=str, default="jacobian",
-                        choices=["jacobian", "z3", "cvc5", "bitwuzla",
-                                 "opensmt", "smt", "portfolio", "sdp"])
+                        choices=["jacobian", "z3", "cvc5", "opensmt",
+                                 "smt", "portfolio", "gurobi", "sdp"])
     parser.add_argument("--cores", type=int, default=0,
                         help="Total CPU cores to use (0=auto, e.g. 32)")
     parser.add_argument("--timeout", type=float, default=None)

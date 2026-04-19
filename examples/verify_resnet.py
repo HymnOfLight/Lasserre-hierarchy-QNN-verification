@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from qnn_verifier.verification.pipeline import VerificationPipeline
 from qnn_verifier.benchmarks.smt_solver import verify_pytorch_with_smt, detect_solvers
+from qnn_verifier.benchmarks.gurobi_solver import verify_pytorch_with_gurobi
 
 logging.basicConfig(
     level=logging.INFO,
@@ -116,6 +117,26 @@ def run_smt(model, x0, true_label, epsilons, input_shape, n_classes, timeout, n_
     return results
 
 
+def run_gurobi(model, x0, true_label, epsilons, input_shape, n_classes, timeout, n_cores, arch):
+    """Run Gurobi MILP verification on last layer."""
+    results = {}
+    for eps in epsilons:
+        print(f"    eps={eps:.4f}: running Gurobi (timeout={timeout}s, cores={n_cores})...")
+        r = verify_pytorch_with_gurobi(
+            model_nn=model, x0=x0, epsilon=eps,
+            true_label=true_label, input_shape=input_shape,
+            n_classes=n_classes, timeout=timeout,
+            total_cores=n_cores, model_name=arch,
+        )
+        elapsed = r["time_seconds"]
+        tag = {"verified": "VERIFIED", "violated": "VIOLATED", "unknown": "UNKNOWN "}.get(r["result"], r["result"])
+        lp_file = r.get("lp_file", "")
+        print(f"    eps={eps:.4f}: [{tag}]  time={elapsed:.2f}s  file={lp_file}")
+        results[eps] = {"verified": r["result"] == "verified", "result": r["result"],
+                        "time": elapsed, "method": "gurobi", "file": lp_file}
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description="Quantized ResNet verification")
     parser.add_argument("--arch", type=str, default="resnet18",
@@ -126,8 +147,8 @@ def main():
     parser.add_argument("--n-bits", type=int, default=8)
     parser.add_argument("--input-size", type=int, default=32)
     parser.add_argument("--solver", type=str, default="jacobian",
-                        choices=["jacobian", "smt", "compare"],
-                        help="jacobian (fast), smt (exact), compare (both)")
+                        choices=["jacobian", "smt", "gurobi", "compare"],
+                        help="jacobian (fast), smt (exact), gurobi (MILP), compare (all)")
     parser.add_argument("--cores", type=int, default=0,
                         help="CPU cores for SMT solvers (0=auto, e.g. 32)")
     parser.add_argument("--timeout", type=float, default=3600,
@@ -190,8 +211,12 @@ def main():
         run_smt(model, x0, true_label, epsilons, input_shape,
                 args.n_classes, args.timeout, n_cores, args.arch)
 
+    elif args.solver == "gurobi":
+        print(f"\n--- Gurobi MILP (cores={n_cores}, timeout={args.timeout}s) ---")
+        run_gurobi(model, x0, true_label, epsilons, input_shape,
+                   args.n_classes, args.timeout, n_cores, args.arch)
+
     elif args.solver == "compare":
-        # Phase 1: Jacobian
         print(f"\n--- Phase 1: Jacobian Bounds ---")
         pipeline = VerificationPipeline(
             model_path=model_path, model_arch=args.arch,
@@ -200,25 +225,34 @@ def main():
         )
         jac_results = run_jacobian(pipeline, x0, true_label, epsilons)
 
-        # Phase 2: SMT
         print(f"\n--- Phase 2: SMT Portfolio (cores={n_cores}, timeout={args.timeout}s) ---")
         smt_results = run_smt(model, x0, true_label, epsilons, input_shape,
                               args.n_classes, args.timeout, n_cores, args.arch)
 
+        print(f"\n--- Phase 3: Gurobi MILP (cores={n_cores}, timeout={args.timeout}s) ---")
+        grb_results = run_gurobi(model, x0, true_label, epsilons, input_shape,
+                                 args.n_classes, args.timeout, n_cores, args.arch)
+
         # Comparison table
-        print(f"\n{'='*72}")
-        print(f"  {'eps':>8}  {'Jacobian':^20}  {'SMT':^20}  {'SMT file'}")
-        print(f"  {'-'*68}")
+        print(f"\n{'='*90}")
+        print(f"  {'eps':>8}  {'Jacobian':^15}  {'SMT':^15}  {'Gurobi':^15}  {'Files'}")
+        print(f"  {'-'*86}")
         for eps in epsilons:
             jr = jac_results.get(eps, {})
             sr = smt_results.get(eps, {})
+            gr = grb_results.get(eps, {})
+
             jv = "VERIFIED" if jr.get("verified") else "UNKNOWN"
             jt = f"{jr.get('time', 0):.2f}s"
-            sv = sr.get("result", "?").upper()
+            sv = sr.get("result", "?").upper()[:8]
             st = f"{sr.get('time', 0):.2f}s"
-            sf = sr.get("file", "")
-            print(f"  {eps:>8.4f}  {jv:>8} {jt:>8}    {sv:>8} {st:>8}  {sf}")
-        print(f"{'='*72}")
+            gv = gr.get("result", "?").upper()[:8]
+            gt = f"{gr.get('time', 0):.2f}s"
+            files = []
+            if sr.get("file"): files.append(f"smt:{Path(sr['file']).name}")
+            if gr.get("file"): files.append(f"lp:{Path(gr['file']).name}")
+            print(f"  {eps:>8.4f}  {jv:>8} {jt:>5}  {sv:>8} {st:>5}  {gv:>8} {gt:>5}  {' '.join(files)}")
+        print(f"{'='*90}")
 
     print("\nDone.")
 
