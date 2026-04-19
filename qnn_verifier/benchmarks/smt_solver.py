@@ -388,6 +388,7 @@ def verify_with_smt(
         lb, ub, out_constraints, stable,
     )
 
+    # Save the base SMT-LIB2 formula
     smt2_path = None
     if save_formula:
         bname = benchmark_name or "unknown"
@@ -395,46 +396,118 @@ def verify_with_smt(
         smt2_path = save_smtlib2(smtlib2, bname, iname)
         logger.info(f"SMT-LIB2 saved: {smt2_path}")
 
-    # If not saved, write to temp file (solvers need a file path)
     if smt2_path is None:
         import tempfile
         fd, smt2_path = tempfile.mkstemp(suffix=".smt2")
         with os.fdopen(fd, "w") as f:
             f.write(smtlib2)
 
-    # Distribute cores: each solver gets n_cores // n_solvers threads
-    threads_per = max(1, n_cores // len(solvers))
+    # ---- True multi-core: domain splitting on unstable ReLU phases ----
+    # Each sub-problem fixes some ReLU neurons to active/inactive,
+    # then generates a fresh (simpler) SMT formula and solves it.
+    # This creates n_cores independent sub-problems.
+
+    unstable_keys = sorted(
+        [k for k, v in stable.items() if v == "unstable"],
+        key=lambda k: k  # stable order
+    )
+
+    n_split = min(int(np.log2(max(n_cores, 1))), len(unstable_keys), 10)
+    n_subproblems = min(2 ** n_split, n_cores)
+    # Pick the first n_split unstable neurons to split on
+    split_keys = unstable_keys[:n_split]
+    solver_to_use = solvers[0] if solvers else "z3"
 
     logger.info(
-        f"SMT portfolio: {solvers} | {n_cores} cores ({threads_per}/solver) | "
+        f"Parallel domain splitting: {n_subproblems} sub-problems on {n_cores} cores | "
+        f"splitting {n_split} ReLU neurons | solver={solver_to_use} | "
         f"ReLU: {len(stable)} total, {n_stable} stable, {n_unstable} unstable"
     )
 
-    tasks = [(s, smt2_path, timeout, threads_per) for s in solvers]
+    # Generate sub-problem SMT files in parallel
+    sub_timeout = max(1, timeout - (time.time() - t0))
+    sub_args = []
+    for combo in range(n_subproblems):
+        fixed = dict(stable)  # copy all stable assignments
+        for bit_idx, key in enumerate(split_keys):
+            fixed[key] = "active" if ((combo >> bit_idx) & 1) else "inactive"
+        sub_args.append((
+            layers, property.n_inputs, property.n_outputs,
+            lb, ub, out_constraints, fixed,
+            solver_to_use, sub_timeout, smt2_path,
+        ))
 
-    # Single solver — no multiprocessing overhead
-    if len(tasks) == 1:
-        name, result, elapsed = _run_solver_process(tasks[0])
-        return _format(result, name, elapsed, n_unstable, solvers, smt2_path)
-
-    # Multi-solver portfolio
+    # Run in parallel
     ctx = multiprocessing.get_context("spawn")
-    with ctx.Pool(len(tasks)) as pool:
-        async_results = [pool.apply_async(_run_solver_process, (t,)) for t in tasks]
+    with ctx.Pool(min(n_subproblems, n_cores)) as pool:
+        async_results = [pool.apply_async(_solve_subproblem_worker, (a,)) for a in sub_args]
 
-        deadline = t0 + timeout + 5
+        deadline = t0 + timeout + 2
+        n_unsat = 0
         while time.time() < deadline:
+            all_done = True
             for ar in async_results:
                 if ar.ready():
-                    name, result, elapsed = ar.get(timeout=1)
-                    if result in ("sat", "unsat"):
+                    try:
+                        result, elapsed = ar.get(timeout=0.1)
+                    except Exception:
+                        result, elapsed = "unknown", 0.0
+                    if result == "sat":
                         pool.terminate()
-                        return _format(result, name, elapsed, n_unstable, solvers, smt2_path)
-            time.sleep(0.2)
-
+                        return _format("sat", f"{solver_to_use}(split)", time.time() - t0,
+                                       n_unstable, solvers, smt2_path)
+                    elif result == "unsat":
+                        n_unsat += 1
+                else:
+                    all_done = False
+            if all_done:
+                break
+            time.sleep(0.1)
         pool.terminate()
 
-    return _format("unknown", "portfolio", time.time() - t0, n_unstable, solvers, smt2_path)
+    total_elapsed = time.time() - t0
+    if n_unsat == n_subproblems:
+        return _format("unsat", f"{solver_to_use}(split×{n_subproblems})", total_elapsed,
+                       n_unstable, solvers, smt2_path)
+
+    return _format("unknown", f"split({n_unsat}/{n_subproblems} unsat)", total_elapsed,
+                   n_unstable, solvers, smt2_path)
+
+
+def _solve_subproblem_worker(args) -> Tuple[str, float]:
+    """Worker: generate a sub-problem SMT formula with fixed ReLU phases and solve it."""
+    (layers, n_inputs, n_outputs, lb, ub, output_constraints,
+     fixed_stable, solver_name, timeout_s, base_smt2_path) = args
+
+    t0 = time.time()
+
+    # Generate SMT-LIB2 with fixed phases
+    smtlib2 = generate_smtlib2(
+        layers, n_inputs, n_outputs, lb, ub, output_constraints, fixed_stable,
+    )
+
+    # Write to temp file
+    import tempfile
+    fd, tmp_path = tempfile.mkstemp(suffix=".smt2")
+    with os.fdopen(fd, "w") as f:
+        f.write(smtlib2)
+
+    try:
+        timeout_ms = int(timeout_s * 1000)
+        if solver_name == "z3":
+            result = _run_z3(tmp_path, timeout_s, 1)
+        elif solver_name == "cvc5":
+            result = _run_cvc5(tmp_path, timeout_s, 1)
+        else:
+            result = _run_generic(solver_name, tmp_path, timeout_s)
+        return result, time.time() - t0
+    except Exception:
+        return "unknown", time.time() - t0
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
 
 
 def _format(result, solver, elapsed, n_unstable, all_solvers, smt2_path):
