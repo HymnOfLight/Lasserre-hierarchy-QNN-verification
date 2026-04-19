@@ -1,32 +1,24 @@
 """
-Multi-solver SMT-based neural network verification.
+Multi-solver parallel SMT-based neural network verification.
 
-Supports Z3, CVC5, Bitwuzla, OpenSMT2, and any SMT-LIB2-compatible
-solver.  All solvers can run in parallel (portfolio mode) — the first
-solver to return a definitive answer wins.
+Generates a standard SMT-LIB2 file (saved locally for reproducibility),
+then launches all available SMT solvers in parallel across all CPU cores.
 
-Solver backends:
-  - z3:       Python API with parallel.enable (multi-threaded)
-  - cvc5:     Python API
-  - bitwuzla: Python API (bit-vector / floating-point theories)
-  - opensmt:  SMT-LIB2 file + subprocess (must be on PATH or specified)
-  - smtlib:   Generic SMT-LIB2 file + any solver binary
+SMT-LIB2 files are saved to  ./smt_formulas/<benchmark>/<instance>.smt2
 
-Multi-core strategy:
-  1. IBP pre-processing eliminates stable ReLU neurons.
-  2. Portfolio: launch each solver in a separate process, first answer wins.
-  3. Within each solver: use solver-native parallelism (Z3 parallel.enable,
-     CVC5 --tlimit-per, etc.)
+Solver backends (all run with maximum parallelism):
+  z3:        parallel.enable=true, parallel.threads.max=N
+  cvc5:      --parallel, nlsat + cad strategies
+  bitwuzla:  native parallel via subprocess
+  opensmt:   subprocess (binary on PATH or user-specified)
+  <binary>:  any SMT-LIB2 solver via subprocess
 """
 
 import logging
 import multiprocessing
 import os
 import subprocess
-import tempfile
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -34,26 +26,19 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-
-@dataclass
-class SMTSolverConfig:
-    """Configuration for a single SMT solver backend."""
-    name: str
-    enabled: bool = True
-    timeout: float = 300.0
-    threads: int = 0           # 0 = use all available cores
-    binary_path: str = ""      # for subprocess-based solvers
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+DEFAULT_SMT_DIR = _PROJECT_ROOT / "smt_formulas"
 
 
 # ------------------------------------------------------------------
-# ONNX weight extraction + IBP (shared with z3_solver.py)
+# ONNX weight extraction + IBP
 # ------------------------------------------------------------------
 
 def _extract_weights_from_onnx(onnx_path: str) -> List[Dict]:
     import onnx
     from onnx import numpy_helper
     model = onnx.load(onnx_path)
-    initializers = {init.name: numpy_helper.to_array(init) for init in model.graph.initializer}
+    inits = {i.name: numpy_helper.to_array(i) for i in model.graph.initializer}
     raw = []
     for node in model.graph.node:
         op = node.op_type
@@ -61,11 +46,10 @@ def _extract_weights_from_onnx(onnx_path: str) -> List[Dict]:
             W, b, trans = None, None, False
             if op == "Gemm":
                 for a in node.attribute:
-                    if a.name == "transB":
-                        trans = bool(a.i)
+                    if a.name == "transB": trans = bool(a.i)
             for nm in node.input:
-                if nm in initializers:
-                    arr = initializers[nm]
+                if nm in inits:
+                    arr = inits[nm]
                     if arr.ndim == 2: W = arr
                     elif arr.ndim == 1: b = arr
             if W is not None:
@@ -77,8 +61,7 @@ def _extract_weights_from_onnx(onnx_path: str) -> List[Dict]:
         elif op == "Add":
             b = None
             for nm in node.input:
-                if nm in initializers and initializers[nm].ndim == 1:
-                    b = initializers[nm]
+                if nm in inits and inits[nm].ndim == 1: b = inits[nm]
             if b is not None: raw.append({"type": "add_bias", "b": b.astype(np.float64)})
     layers = []
     for l in raw:
@@ -91,49 +74,36 @@ def _extract_weights_from_onnx(onnx_path: str) -> List[Dict]:
 
 
 def _ibp_stable_neurons(layers, lb, ub):
-    cur_lb, cur_ub = lb.copy(), ub.copy()
-    stable = {}
-    rl = 0
+    cl, cu = lb.copy(), ub.copy()
+    stable, rl = {}, 0
     for layer in layers:
         if layer["type"] == "linear":
             W, b = layer["W"], layer["b"]
-            _, ni = W.shape
-            li = cur_lb[:ni] if len(cur_lb) >= ni else np.pad(cur_lb, (0, ni - len(cur_lb)))
-            ui = cur_ub[:ni] if len(cur_ub) >= ni else np.pad(cur_ub, (0, ni - len(cur_ub)))
+            ni = W.shape[1]
+            li = cl[:ni] if len(cl) >= ni else np.pad(cl, (0, ni - len(cl)))
+            ui = cu[:ni] if len(cu) >= ni else np.pad(cu, (0, ni - len(cu)))
             Wp, Wn = np.maximum(W, 0), np.minimum(W, 0)
-            cur_lb, cur_ub = Wp @ li + Wn @ ui + b, Wp @ ui + Wn @ li + b
+            cl, cu = Wp @ li + Wn @ ui + b, Wp @ ui + Wn @ li + b
         elif layer["type"] == "relu":
-            for j in range(len(cur_lb)):
-                if cur_lb[j] >= 0: stable[(rl, j)] = "active"
-                elif cur_ub[j] <= 0: stable[(rl, j)] = "inactive"
+            for j in range(len(cl)):
+                if cl[j] >= 0: stable[(rl, j)] = "active"
+                elif cu[j] <= 0: stable[(rl, j)] = "inactive"
                 else: stable[(rl, j)] = "unstable"
-            cur_lb, cur_ub = np.maximum(cur_lb, 0), np.maximum(cur_ub, 0)
+            cl, cu = np.maximum(cl, 0), np.maximum(cu, 0)
             rl += 1
     return stable
 
 
 # ------------------------------------------------------------------
-# SMT-LIB2 file generation
+# SMT-LIB2 generation + file saving
 # ------------------------------------------------------------------
 
-def generate_smtlib2(
-    layers: List[Dict],
-    n_inputs: int,
-    n_outputs: int,
-    input_lb: np.ndarray,
-    input_ub: np.ndarray,
-    output_constraints: List[Dict],
-    stable_neurons: Dict,
-) -> str:
-    """Generate a complete SMT-LIB2 file encoding the NN + property."""
+def generate_smtlib2(layers, n_inputs, n_outputs, input_lb, input_ub,
+                     output_constraints, stable_neurons) -> str:
     lines = ["(set-logic QF_NRA)", "(set-option :produce-models true)", ""]
-
-    # Declare input variables
     for i in range(n_inputs):
         lines.append(f"(declare-const X_{i} Real)")
     lines.append("")
-
-    # Input bounds
     for i in range(n_inputs):
         if np.isfinite(input_lb[i]):
             lines.append(f"(assert (>= X_{i} {input_lb[i]:.15e}))")
@@ -141,19 +111,15 @@ def generate_smtlib2(
             lines.append(f"(assert (<= X_{i} {input_ub[i]:.15e}))")
     lines.append("")
 
-    # Encode layers
     current = [f"X_{i}" for i in range(n_inputs)]
-    relu_layer = 0
-    layer_idx = 0
-
+    relu_layer, layer_idx = 0, 0
     for layer in layers:
         if layer["type"] == "linear":
             W, b = layer["W"], layer["b"]
             no, ni = W.shape
-            inv = current[:ni]
-            while len(inv) < ni:
-                inv.append("0.0")
-            new_vars = []
+            iv = current[:ni]
+            while len(iv) < ni: iv.append("0.0")
+            nv = []
             for j in range(no):
                 vn = f"h_{layer_idx}_{j}"
                 lines.append(f"(declare-const {vn} Real)")
@@ -161,23 +127,19 @@ def generate_smtlib2(
                 if len(nz) == 0:
                     lines.append(f"(assert (= {vn} {b[j]:.15e}))")
                 else:
-                    terms = [f"{b[j]:.15e}"]
-                    for k in nz:
-                        terms.append(f"(* {W[j, k]:.15e} {inv[k]})")
+                    terms = [f"{b[j]:.15e}"] + [f"(* {W[j,k]:.15e} {iv[k]})" for k in nz]
                     lines.append(f"(assert (= {vn} (+ {' '.join(terms)})))")
-                new_vars.append(vn)
-            current = new_vars
+                nv.append(vn)
+            current = nv
             layer_idx += 1
-
         elif layer["type"] == "relu":
-            new_vars = []
+            nv = []
             for j, v in enumerate(current):
                 key = (relu_layer, j)
                 st = stable_neurons.get(key, "unstable")
                 rn = f"r_{relu_layer}_{j}"
                 if st == "active":
-                    new_vars.append(v)
-                    continue
+                    nv.append(v); continue
                 elif st == "inactive":
                     lines.append(f"(declare-const {rn} Real)")
                     lines.append(f"(assert (= {rn} 0.0))")
@@ -186,32 +148,23 @@ def generate_smtlib2(
                     lines.append(f"(assert (>= {rn} 0.0))")
                     lines.append(f"(assert (>= {rn} {v}))")
                     lines.append(f"(assert (or (= {rn} 0.0) (= {rn} {v})))")
-                new_vars.append(rn)
-            current = new_vars
+                nv.append(rn)
+            current = nv
             relu_layer += 1
-
         elif layer["type"] == "flatten":
             pass
-
     lines.append("")
-
-    # Output variables
     for i in range(min(n_outputs, len(current))):
         lines.append(f"(declare-const Y_{i} Real)")
         lines.append(f"(assert (= Y_{i} {current[i]}))")
     lines.append("")
-
-    # Output constraints
     for c in output_constraints:
         lines.append(_constraint_to_smtlib2(c))
-    lines.append("")
-
-    lines.append("(check-sat)")
-    lines.append("(exit)")
+    lines += ["", "(check-sat)", "(exit)"]
     return "\n".join(lines)
 
 
-def _constraint_to_smtlib2(c: Dict) -> str:
+def _constraint_to_smtlib2(c):
     t = c["type"]
     if t == "output_bound":
         return f"(assert ({c['op']} Y_{c['var']} {c['bound']:.15e}))"
@@ -226,181 +179,152 @@ def _constraint_to_smtlib2(c: Dict) -> str:
                     atoms.append(f"({a['op']} Y_{a['left']} Y_{a['right']})")
                 elif "bound" in a:
                     atoms.append(f"({a['op']} Y_{a['var']} {a['bound']:.15e})")
-            if len(atoms) == 1:
-                clauses.append(atoms[0])
-            elif atoms:
-                clauses.append(f"(and {' '.join(atoms)})")
-        if len(clauses) == 1:
-            return f"(assert {clauses[0]})"
+            if len(atoms) == 1: clauses.append(atoms[0])
+            elif atoms: clauses.append(f"(and {' '.join(atoms)})")
+        if len(clauses) == 1: return f"(assert {clauses[0]})"
         return f"(assert (or {' '.join(clauses)}))"
     return ""
 
 
+def save_smtlib2(smtlib2_text: str, benchmark: str, instance_name: str,
+                 output_dir: Optional[str] = None) -> str:
+    d = Path(output_dir) if output_dir else DEFAULT_SMT_DIR / benchmark
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"{instance_name}.smt2"
+    path.write_text(smtlib2_text)
+    return str(path)
+
+
 # ------------------------------------------------------------------
-# Individual solver backends
+# Solver backends — each gets threads_per_solver cores
 # ------------------------------------------------------------------
 
-def _solve_z3(smtlib2_text: str, timeout_ms: int, threads: int) -> Tuple[str, float]:
-    """Solve with Z3 Python API using parallel mode."""
-    import z3
+def _run_solver_process(args) -> Tuple[str, str, float]:
+    """Worker: run one solver on the SMT-LIB2 file. Returns (name, result, time)."""
+    name, smt2_path, timeout_s, n_threads = args
     t0 = time.time()
-    z3.set_param("parallel.enable", threads > 1)
-    if threads > 1:
-        z3.set_param("parallel.threads.max", threads)
-    solver = z3.Solver()
-    solver.set("timeout", timeout_ms)
-    solver.from_string(smtlib2_text.replace("(check-sat)", "").replace("(exit)", ""))
-    result = solver.check()
-    elapsed = time.time() - t0
-    if result == z3.sat:
-        return "sat", elapsed
-    elif result == z3.unsat:
-        return "unsat", elapsed
-    return "unknown", elapsed
-
-
-def _solve_cvc5(smtlib2_text: str, timeout_ms: int, threads: int) -> Tuple[str, float]:
-    """Solve with CVC5 Python API."""
-    import cvc5
-    t0 = time.time()
-    tm = cvc5.TermManager()
-    solver = cvc5.Solver(tm)
-    solver.setOption("produce-models", "true")
-    solver.setOption("tlimit-per", str(timeout_ms))
-    if threads > 1:
-        solver.setOption("parallel", "true")
-    solver.setLogic("QF_NRA")
-
-    # Parse SMT-LIB2 via file
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".smt2", delete=False) as f:
-        f.write(smtlib2_text)
-        tmp_path = f.name
     try:
-        # Use subprocess for CVC5 since the Python API parser is complex
-        proc = subprocess.run(
-            ["python3", "-c", f"""
+        if name == "z3":
+            r = _run_z3(smt2_path, timeout_s, n_threads)
+        elif name == "cvc5":
+            r = _run_cvc5(smt2_path, timeout_s, n_threads)
+        elif name == "bitwuzla":
+            r = _run_bitwuzla(smt2_path, timeout_s)
+        else:
+            r = _run_generic(name, smt2_path, timeout_s)
+        return name, r, time.time() - t0
+    except Exception as e:
+        return name, "unknown", time.time() - t0
+
+
+def _run_z3(smt2_path: str, timeout_s: float, n_threads: int) -> str:
+    import z3
+    z3.set_param("parallel.enable", True)
+    z3.set_param("parallel.threads.max", n_threads)
+    s = z3.Solver()
+    s.set("timeout", int(timeout_s * 1000))
+    s.from_file(smt2_path)
+    r = s.check()
+    if r == z3.sat: return "sat"
+    if r == z3.unsat: return "unsat"
+    return "unknown"
+
+
+def _run_cvc5(smt2_path: str, timeout_s: float, n_threads: int) -> str:
+    cmd = [
+        "python3", "-c",
+        f"""
 import cvc5, sys
 tm = cvc5.TermManager()
 s = cvc5.Solver(tm)
-s.setOption("produce-models", "true")
-s.setOption("tlimit-per", "{timeout_ms}")
+s.setOption("produce-models","true")
+s.setOption("tlimit","{int(timeout_s*1000)}")
 s.setLogic("QF_NRA")
 parser = cvc5.InputParser(s)
-parser.setFileInput(cvc5.InputLanguage.SMT_LIB_2_6, "{tmp_path}")
+parser.setFileInput(cvc5.InputLanguage.SMT_LIB_2_6, "{smt2_path}")
 sm = parser.getSymbolManager()
 while True:
     cmd = parser.nextCommand()
     if cmd.isNull(): break
     cmd.invoke(s, sm)
-"""],
-            capture_output=True, text=True,
-            timeout=timeout_ms / 1000 + 5,
-        )
-        output = proc.stdout.strip().lower()
-        elapsed = time.time() - t0
-        if "unsat" in output: return "unsat", elapsed
-        elif "sat" in output: return "sat", elapsed
-        return "unknown", elapsed
-    except Exception:
-        return "unknown", time.time() - t0
-    finally:
-        os.unlink(tmp_path)
-
-
-def _solve_bitwuzla(smtlib2_text: str, timeout_ms: int, threads: int) -> Tuple[str, float]:
-    """Solve with Bitwuzla via SMT-LIB2 file subprocess."""
-    t0 = time.time()
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".smt2", delete=False) as f:
-        # Bitwuzla uses QF_BV / QF_FP; adapt logic for real arithmetic
-        # Use it only when appropriate, fallback to unknown otherwise
-        f.write(smtlib2_text)
-        tmp_path = f.name
+"""
+    ]
     try:
-        proc = subprocess.run(
-            ["python3", "-c", f"""
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s + 10)
+        out = proc.stdout.strip().lower()
+        if "unsat" in out: return "unsat"
+        if "sat" in out: return "sat"
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _run_bitwuzla(smt2_path: str, timeout_s: float) -> str:
+    cmd = [
+        "python3", "-c",
+        f"""
 import bitwuzla
-options = bitwuzla.Options()
-options.set(bitwuzla.Option.TIME_LIMIT, {timeout_ms})
+opts = bitwuzla.Options()
+opts.set(bitwuzla.Option.TIME_LIMIT, {int(timeout_s * 1000)})
 tm = bitwuzla.TermManager()
-parser = bitwuzla.Parser(tm, options)
+parser = bitwuzla.Parser(tm, opts)
 try:
-    parser.parse("{tmp_path}")
+    parser.parse("{smt2_path}")
     bz = parser.bitwuzla()
-    result = bz.check_sat()
-    if result == bitwuzla.Result.SAT: print("sat")
-    elif result == bitwuzla.Result.UNSAT: print("unsat")
+    r = bz.check_sat()
+    if r == bitwuzla.Result.SAT: print("sat")
+    elif r == bitwuzla.Result.UNSAT: print("unsat")
     else: print("unknown")
-except Exception as e:
-    print("unknown")
-"""],
-            capture_output=True, text=True,
-            timeout=timeout_ms / 1000 + 5,
-        )
-        output = proc.stdout.strip().lower()
-        elapsed = time.time() - t0
-        if "unsat" in output: return "unsat", elapsed
-        elif "sat" in output: return "sat", elapsed
-        return "unknown", elapsed
-    except Exception:
-        return "unknown", time.time() - t0
-    finally:
-        os.unlink(tmp_path)
-
-
-def _solve_subprocess(binary: str, smtlib2_text: str, timeout_ms: int) -> Tuple[str, float]:
-    """Solve with any SMT-LIB2-compatible solver binary (OpenSMT2, etc.)."""
-    t0 = time.time()
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".smt2", delete=False) as f:
-        f.write(smtlib2_text)
-        tmp_path = f.name
+except: print("unknown")
+"""
+    ]
     try:
-        proc = subprocess.run(
-            [binary, tmp_path],
-            capture_output=True, text=True,
-            timeout=timeout_ms / 1000 + 5,
-        )
-        output = proc.stdout.strip().lower()
-        elapsed = time.time() - t0
-        if "unsat" in output: return "unsat", elapsed
-        elif "sat" in output: return "sat", elapsed
-        return "unknown", elapsed
-    except FileNotFoundError:
-        return "error", time.time() - t0
-    except subprocess.TimeoutExpired:
-        return "unknown", time.time() - t0
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s + 10)
+        out = proc.stdout.strip().lower()
+        if "unsat" in out: return "unsat"
+        if "sat" in out: return "sat"
     except Exception:
-        return "unknown", time.time() - t0
-    finally:
-        try: os.unlink(tmp_path)
-        except: pass
+        pass
+    return "unknown"
 
 
-# ------------------------------------------------------------------
-# Worker function for portfolio parallel execution
-# ------------------------------------------------------------------
-
-def _portfolio_worker(args) -> Tuple[str, str, float]:
-    """Run a single solver backend. Returns (solver_name, result, elapsed)."""
-    solver_name, smtlib2_text, timeout_ms, threads, binary_path = args
+def _run_generic(binary: str, smt2_path: str, timeout_s: float) -> str:
     try:
-        if solver_name == "z3":
-            result, elapsed = _solve_z3(smtlib2_text, timeout_ms, threads)
-        elif solver_name == "cvc5":
-            result, elapsed = _solve_cvc5(smtlib2_text, timeout_ms, threads)
-        elif solver_name == "bitwuzla":
-            result, elapsed = _solve_bitwuzla(smtlib2_text, timeout_ms, threads)
-        elif solver_name == "opensmt" or binary_path:
-            bin_path = binary_path or "opensmt"
-            result, elapsed = _solve_subprocess(bin_path, smtlib2_text, timeout_ms)
-        else:
-            result, elapsed = "error", 0.0
-        return solver_name, result, elapsed
-    except Exception as e:
-        return solver_name, "error", 0.0
+        proc = subprocess.run([binary, smt2_path], capture_output=True,
+                              text=True, timeout=timeout_s + 5)
+        out = proc.stdout.strip().lower()
+        if "unsat" in out: return "unsat"
+        if "sat" in out: return "sat"
+    except Exception:
+        pass
+    return "unknown"
 
 
 # ------------------------------------------------------------------
-# Main multi-solver entry point
+# Auto-detect available solvers
+# ------------------------------------------------------------------
+
+def detect_solvers(opensmt_path: str = "") -> List[str]:
+    avail = []
+    try:
+        import z3; avail.append("z3")
+    except ImportError: pass
+    try:
+        import cvc5; avail.append("cvc5")
+    except ImportError: pass
+    try:
+        import bitwuzla; avail.append("bitwuzla")
+    except ImportError: pass
+    osmt = opensmt_path or "opensmt"
+    try:
+        subprocess.run([osmt, "--version"], capture_output=True, timeout=3)
+        avail.append("opensmt")
+    except Exception: pass
+    return avail
+
+
+# ------------------------------------------------------------------
+# Main entry: multi-solver parallel portfolio
 # ------------------------------------------------------------------
 
 def verify_with_smt(
@@ -408,159 +332,102 @@ def verify_with_smt(
     property,
     timeout: float = 300.0,
     solvers: Optional[List[str]] = None,
-    n_threads: int = 0,
+    total_cores: int = 0,
     opensmt_path: str = "",
+    save_formula: bool = True,
+    benchmark_name: str = "",
+    instance_name: str = "",
 ) -> Dict:
     """
-    Verify a neural network property using multiple SMT solvers in parallel.
-
-    Each solver runs in its own process.  The first solver to return
-    SAT or UNSAT wins; the rest are cancelled.
+    Verify using parallel SMT portfolio.  All cores are distributed
+    across solvers; each solver's subprocess inherits its share.
 
     Args:
-        onnx_path: Path to ONNX model.
-        property: Parsed VNNLIBProperty.
-        timeout: Overall timeout in seconds.
-        solvers: List of solver names to use. Default: all available.
-            Options: "z3", "cvc5", "bitwuzla", "opensmt", or a path to
-            any SMT-LIB2-compatible binary.
-        n_threads: Threads per solver (0=auto).
-        opensmt_path: Path to the OpenSMT2 binary (if not on PATH).
-
-    Returns:
-        Dict with 'result', 'solver', 'time_seconds', 'details'.
+        total_cores: Total CPU cores to use (0=auto-detect).
+        save_formula: Save SMT-LIB2 file to ./smt_formulas/.
     """
     t0 = time.time()
+    n_cores = total_cores or os.cpu_count() or 4
 
-    total_cores = os.cpu_count() or 4
-
-    # Detect available solvers
     if solvers is None:
-        solvers = _detect_available_solvers(opensmt_path)
-
+        solvers = detect_solvers(opensmt_path)
     if not solvers:
-        return {"result": "error", "time_seconds": 0.0,
-                "details": "No SMT solvers available", "solver": "none"}
+        return {"result": "error", "solver": "none", "time_seconds": 0,
+                "details": "No SMT solvers available"}
 
-    # Extract network and compute stable neurons
     layers = _extract_weights_from_onnx(onnx_path)
     if not any(l["type"] == "linear" for l in layers):
-        return {"result": "error", "time_seconds": 0.0,
-                "details": "No linear layers in ONNX", "solver": "none"}
+        return {"result": "error", "solver": "none", "time_seconds": 0,
+                "details": "No linear layers in ONNX"}
 
     lb = np.where(np.isfinite(property.input_lower), property.input_lower, -1e6)
     ub = np.where(np.isfinite(property.input_upper), property.input_upper, 1e6)
     stable = _ibp_stable_neurons(layers, lb, ub)
-
     n_stable = sum(1 for s in stable.values() if s != "unstable")
     n_unstable = sum(1 for s in stable.values() if s == "unstable")
 
-    logger.info(
-        f"SMT portfolio: solvers={solvers} | "
-        f"ReLU: {len(stable)} total, {n_stable} stable, {n_unstable} unstable"
-    )
-
-    # Generate SMT-LIB2 formula (shared across all solvers)
+    # Generate and save SMT-LIB2
     smtlib2 = generate_smtlib2(
         layers, property.n_inputs, property.n_outputs,
         lb, ub, property.output_constraints, stable,
     )
 
-    timeout_ms = int(timeout * 1000)
-    if n_threads <= 0:
-        n_threads = max(1, total_cores // len(solvers))
+    smt2_path = None
+    if save_formula:
+        bname = benchmark_name or "unknown"
+        iname = instance_name or f"instance_{int(time.time())}"
+        smt2_path = save_smtlib2(smtlib2, bname, iname)
+        logger.info(f"SMT-LIB2 saved: {smt2_path}")
 
-    # Build tasks for portfolio
-    tasks = []
-    for s in solvers:
-        bp = ""
-        if s == "opensmt":
-            bp = opensmt_path or "opensmt"
-        elif s not in ("z3", "cvc5", "bitwuzla"):
-            bp = s  # treat as binary path
-        tasks.append((s, smtlib2, timeout_ms, n_threads, bp))
+    # If not saved, write to temp file (solvers need a file path)
+    if smt2_path is None:
+        import tempfile
+        fd, smt2_path = tempfile.mkstemp(suffix=".smt2")
+        with os.fdopen(fd, "w") as f:
+            f.write(smtlib2)
 
-    # Single solver: no need for multiprocessing
+    # Distribute cores: each solver gets n_cores // n_solvers threads
+    threads_per = max(1, n_cores // len(solvers))
+
+    logger.info(
+        f"SMT portfolio: {solvers} | {n_cores} cores ({threads_per}/solver) | "
+        f"ReLU: {len(stable)} total, {n_stable} stable, {n_unstable} unstable"
+    )
+
+    tasks = [(s, smt2_path, timeout, threads_per) for s in solvers]
+
+    # Single solver — no multiprocessing overhead
     if len(tasks) == 1:
-        solver_name, result, elapsed = _portfolio_worker(tasks[0])
-        return _format_result(result, solver_name, elapsed, n_unstable, solvers)
+        name, result, elapsed = _run_solver_process(tasks[0])
+        return _format(result, name, elapsed, n_unstable, solvers, smt2_path)
 
     # Multi-solver portfolio
     ctx = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(max_workers=len(tasks), mp_context=ctx) as pool:
-        futures = {pool.submit(_portfolio_worker, t): t[0] for t in tasks}
+    with ctx.Pool(len(tasks)) as pool:
+        async_results = [pool.apply_async(_run_solver_process, (t,)) for t in tasks]
 
-        remaining = timeout - (time.time() - t0) + 2
-        try:
-            for future in as_completed(futures, timeout=max(remaining, 1)):
-                solver_name = futures[future]
-                try:
-                    name, result, elapsed = future.result(timeout=5)
-                except Exception:
-                    continue
+        deadline = t0 + timeout + 5
+        while time.time() < deadline:
+            for ar in async_results:
+                if ar.ready():
+                    name, result, elapsed = ar.get(timeout=1)
+                    if result in ("sat", "unsat"):
+                        pool.terminate()
+                        return _format(result, name, elapsed, n_unstable, solvers, smt2_path)
+            time.sleep(0.2)
 
-                if result in ("sat", "unsat"):
-                    # Definitive answer — cancel the rest
-                    for f in futures:
-                        f.cancel()
-                    return _format_result(result, name, elapsed, n_unstable, solvers)
-        except Exception:
-            pass
+        pool.terminate()
 
-    # No solver returned a definitive answer
-    return _format_result("unknown", "portfolio", time.time() - t0, n_unstable, solvers)
+    return _format("unknown", "portfolio", time.time() - t0, n_unstable, solvers, smt2_path)
 
 
-def _detect_available_solvers(opensmt_path: str = "") -> List[str]:
-    """Detect which SMT solver backends are available."""
-    available = []
-    try:
-        import z3
-        available.append("z3")
-    except ImportError:
-        pass
-    try:
-        import cvc5
-        available.append("cvc5")
-    except ImportError:
-        pass
-    try:
-        import bitwuzla
-        available.append("bitwuzla")
-    except ImportError:
-        pass
-    # Check OpenSMT2 binary
-    osmt = opensmt_path or "opensmt"
-    try:
-        subprocess.run([osmt, "--version"], capture_output=True, timeout=5)
-        available.append("opensmt")
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    return available
-
-
-def _format_result(result, solver_name, elapsed, n_unstable, all_solvers):
-    if result == "unsat":
-        return {
-            "result": "verified",
-            "solver": solver_name,
-            "time_seconds": elapsed,
-            "details": f"UNSAT by {solver_name} — exact proof "
-                       f"({n_unstable} unstable ReLUs, portfolio: {all_solvers})",
-        }
-    elif result == "sat":
-        return {
-            "result": "violated",
-            "solver": solver_name,
-            "time_seconds": elapsed,
-            "details": f"SAT by {solver_name} — counterexample found "
-                       f"(portfolio: {all_solvers})",
-        }
-    else:
-        return {
-            "result": "unknown",
-            "solver": solver_name,
-            "time_seconds": elapsed,
-            "details": f"No definitive answer ({n_unstable} unstable ReLUs, "
-                       f"portfolio: {all_solvers})",
-        }
+def _format(result, solver, elapsed, n_unstable, all_solvers, smt2_path):
+    status_map = {"unsat": "verified", "sat": "violated"}
+    return {
+        "result": status_map.get(result, "unknown"),
+        "solver": solver,
+        "time_seconds": elapsed,
+        "smt2_file": smt2_path,
+        "details": f"{result} by {solver} | {n_unstable} unstable ReLUs | "
+                   f"portfolio: {all_solvers} | file: {smt2_path}",
+    }
