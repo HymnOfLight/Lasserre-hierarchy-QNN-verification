@@ -361,14 +361,31 @@ def verify_with_smt(
 
     lb = np.where(np.isfinite(property.input_lower), property.input_lower, -1e6)
     ub = np.where(np.isfinite(property.input_upper), property.input_upper, 1e6)
-    stable = _ibp_stable_neurons(layers, lb, ub)
+
+    # Prolog-style symbolic rewrite pre-processing
+    from .symbolic_rewrite import symbolic_rewrite_preprocess
+    layers, lb, ub, stable, out_constraints, rw_stats = symbolic_rewrite_preprocess(
+        layers, lb, ub, property.output_constraints, property.n_outputs,
+    )
+
+    if rw_stats.early_unsat:
+        smt2_path = ""
+        if save_formula:
+            bname = benchmark_name or "unknown"
+            iname = instance_name or f"instance_{int(time.time())}"
+            smt2_path = save_smtlib2("; EARLY UNSAT by symbolic rewrite\n(set-logic QF_NRA)\n(assert false)\n(check-sat)\n(exit)",
+                                     bname, iname)
+        return {"result": "verified", "solver": "symbolic_rewrite",
+                "time_seconds": rw_stats.time_seconds, "smt2_file": smt2_path,
+                "details": f"UNSAT by symbolic rewrite pre-processing | {rw_stats.summary()}"}
+
     n_stable = sum(1 for s in stable.values() if s != "unstable")
     n_unstable = sum(1 for s in stable.values() if s == "unstable")
 
     # Generate and save SMT-LIB2
     smtlib2 = generate_smtlib2(
         layers, property.n_inputs, property.n_outputs,
-        lb, ub, property.output_constraints, stable,
+        lb, ub, out_constraints, stable,
     )
 
     smt2_path = None
