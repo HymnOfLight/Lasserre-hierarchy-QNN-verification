@@ -100,6 +100,23 @@ def verify_with_gurobi(
     lb_in = np.where(np.isfinite(property.input_lower), property.input_lower, -1e6)
     ub_in = np.where(np.isfinite(property.input_upper), property.input_upper, 1e6)
 
+    # Prolog-style symbolic rewrite pre-processing
+    from .symbolic_rewrite import symbolic_rewrite_preprocess
+    layers, lb_in, ub_in, stable_from_rewrite, out_constraints, rw_stats = \
+        symbolic_rewrite_preprocess(layers, lb_in, ub_in, property.output_constraints, n_outputs)
+
+    if rw_stats.early_unsat:
+        lp_path = ""
+        if save_lp:
+            d = DEFAULT_LP_DIR / (benchmark_name or "unknown")
+            d.mkdir(parents=True, exist_ok=True)
+            lp_path = str(d / f"{instance_name or 'instance'}_UNSAT.lp")
+            with open(lp_path, "w") as f:
+                f.write("\\ UNSAT by symbolic rewrite pre-processing\n")
+        return {"result": "verified", "solver": "symbolic_rewrite+gurobi",
+                "time_seconds": rw_stats.time_seconds, "lp_file": lp_path,
+                "details": f"UNSAT by symbolic rewrite | {rw_stats.summary()}"}
+
     ibp = _ibp_bounds(layers, lb_in, ub_in)
 
     # Build Gurobi model
