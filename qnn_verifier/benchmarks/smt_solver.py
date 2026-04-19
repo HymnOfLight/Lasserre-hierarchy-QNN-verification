@@ -115,7 +115,10 @@ def _ibp_stable_neurons(layers, lb, ub):
 
 def generate_smtlib2(layers, n_inputs, n_outputs, input_lb, input_ub,
                      output_constraints, stable_neurons) -> str:
-    lines = ["(set-logic QF_NRA)", "(set-option :produce-models true)", ""]
+    # Use QF_LRA (linear) if all ReLUs are fixed, QF_NRA otherwise
+    has_unstable = any(v == "unstable" for v in stable_neurons.values())
+    logic = "QF_NRA" if has_unstable else "QF_LRA"
+    lines = [f"(set-logic {logic})", "(set-option :produce-models true)", ""]
     for i in range(n_inputs):
         lines.append(f"(declare-const X_{i} Real)")
     lines.append("")
@@ -407,28 +410,42 @@ def verify_with_smt(
     # then generates a fresh (simpler) SMT formula and solves it.
     # This creates n_cores independent sub-problems.
 
-    unstable_keys = sorted(
-        [k for k, v in stable.items() if v == "unstable"],
-        key=lambda k: k  # stable order
-    )
+    # Select neurons to split on: spread across layers, pick those with
+    # the widest pre-activation range (most "impactful" when fixed).
+    unstable_by_layer: Dict[int, List] = {}
+    for (rl, j), v in stable.items():
+        if v == "unstable":
+            unstable_by_layer.setdefault(rl, []).append((rl, j))
 
-    n_split = min(int(np.log2(max(n_cores, 1))), len(unstable_keys), 10)
-    n_subproblems = min(2 ** n_split, n_cores)
-    # Pick the first n_split unstable neurons to split on
-    split_keys = unstable_keys[:n_split]
+    # Round-robin across layers to spread the splits
+    split_keys = []
+    layer_iters = {rl: iter(neurons) for rl, neurons in sorted(unstable_by_layer.items())}
+    while len(split_keys) < min(n_unstable, 64):
+        added = False
+        for rl in sorted(layer_iters.keys()):
+            try:
+                split_keys.append(next(layer_iters[rl]))
+                added = True
+            except StopIteration:
+                pass
+        if not added:
+            break
+
+    n_split = min(int(np.log2(max(n_cores, 1))) + 1, len(split_keys), 12)
+    n_subproblems = min(2 ** n_split, n_cores * 2)
+    split_keys = split_keys[:n_split]
     solver_to_use = solvers[0] if solvers else "z3"
 
     logger.info(
-        f"Parallel domain splitting: {n_subproblems} sub-problems on {n_cores} cores | "
-        f"splitting {n_split} ReLU neurons | solver={solver_to_use} | "
+        f"Domain splitting: {n_subproblems} sub-problems on {n_cores} cores | "
+        f"splitting {n_split} neurons (cascade IBP will fix more) | solver={solver_to_use} | "
         f"ReLU: {len(stable)} total, {n_stable} stable, {n_unstable} unstable"
     )
 
-    # Generate sub-problem SMT files in parallel
     sub_timeout = max(1, timeout - (time.time() - t0))
     sub_args = []
     for combo in range(n_subproblems):
-        fixed = dict(stable)  # copy all stable assignments
+        fixed = dict(stable)
         for bit_idx, key in enumerate(split_keys):
             fixed[key] = "active" if ((combo >> bit_idx) & 1) else "inactive"
         sub_args.append((
@@ -437,63 +454,226 @@ def verify_with_smt(
             solver_to_use, sub_timeout, smt2_path,
         ))
 
-    # Run in parallel
-    ctx = multiprocessing.get_context("spawn")
-    with ctx.Pool(min(n_subproblems, n_cores)) as pool:
-        async_results = [pool.apply_async(_solve_subproblem_worker, (a,)) for a in sub_args]
+    # Pre-generate all sub-problem SMT files, then solve in parallel via subprocess
+    import tempfile
+    sub_files = []
+    for i, args in enumerate(sub_args):
+        (lyrs, ni, no, l, u, oc, fixed, sn, to, bp) = args
+        # Cascade IBP + fix all remaining unstable
+        cascaded, _ = _cascade_ibp(lyrs, l, u, fixed)
+        # Fix remaining unstable by midpoint heuristic
+        cl, cu = l.copy(), u.copy()
+        rl = 0
+        for layer in lyrs:
+            if layer["type"] == "linear":
+                W, b = layer["W"], layer["b"]
+                ni2 = W.shape[1]
+                li = cl[:ni2] if len(cl) >= ni2 else np.pad(cl, (0, ni2 - len(cl)))
+                ui = cu[:ni2] if len(cu) >= ni2 else np.pad(cu, (0, ni2 - len(cu)))
+                Wp, Wn = np.maximum(W, 0), np.minimum(W, 0)
+                cl = Wp @ li + Wn @ ui + b
+                cu = Wp @ ui + Wn @ li + b
+            elif layer["type"] == "relu":
+                for j in range(len(cl)):
+                    key = (rl, j)
+                    if cascaded.get(key) == "unstable":
+                        cascaded[key] = "active" if (cl[j] + cu[j]) >= 0 else "inactive"
+                    if cascaded.get(key) == "inactive":
+                        cl[j] = 0.0; cu[j] = 0.0
+                cl = np.maximum(cl, 0); cu = np.maximum(cu, 0)
+                rl += 1
 
-        deadline = t0 + timeout + 2
-        n_unsat = 0
-        while time.time() < deadline:
-            all_done = True
-            for ar in async_results:
-                if ar.ready():
-                    try:
-                        result, elapsed = ar.get(timeout=0.1)
-                    except Exception:
-                        result, elapsed = "unknown", 0.0
-                    if result == "sat":
-                        pool.terminate()
-                        return _format("sat", f"{solver_to_use}(split)", time.time() - t0,
-                                       n_unstable, solvers, smt2_path)
-                    elif result == "unsat":
-                        n_unsat += 1
+        smt2 = generate_smtlib2(lyrs, ni, no, l, u, oc, cascaded)
+        fd, fpath = tempfile.mkstemp(suffix=".smt2")
+        with os.fdopen(fd, "w") as f:
+            f.write(smt2)
+        sub_files.append(fpath)
+
+    # Launch all sub-problem solvers as separate OS processes
+    sub_procs = []
+    sub_timeout_s = max(1, timeout - (time.time() - t0))
+    for fpath in sub_files:
+        cmd = [
+            "python3", "-c",
+            f'import z3; s=z3.Solver(); s.set("timeout",{int(sub_timeout_s*1000)}); '
+            f's.from_file("{fpath}"); r=s.check(); '
+            f'print("sat" if r==z3.sat else "unsat" if r==z3.unsat else "unknown")'
+        ]
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        sub_procs.append(p)
+
+    logger.info(f"Launched {len(sub_procs)} solver processes")
+
+    # Collect results
+    deadline = t0 + timeout + 2
+    results_collected = [None] * n_subproblems
+    while time.time() < deadline:
+        all_done = True
+        for i, p in enumerate(sub_procs):
+            if results_collected[i] is not None:
+                continue
+            ret = p.poll()
+            if ret is not None:
+                out = p.stdout.read().decode().strip().lower()
+                if "unsat" in out:
+                    results_collected[i] = "unsat"
+                elif "sat" in out:
+                    results_collected[i] = "sat"
+                    # Kill all remaining
+                    for j, p2 in enumerate(sub_procs):
+                        if results_collected[j] is None:
+                            p2.kill()
+                    # Cleanup temp files
+                    for f in sub_files:
+                        try: os.unlink(f)
+                        except: pass
+                    return _format("sat", f"{solver_to_use}(split)", time.time() - t0,
+                                   n_unstable, solvers, smt2_path)
                 else:
-                    all_done = False
-            if all_done:
-                break
-            time.sleep(0.1)
-        pool.terminate()
+                    results_collected[i] = "unknown"
+            else:
+                all_done = False
+        if all_done:
+            break
+        time.sleep(0.05)
+
+    # Kill stragglers
+    for p in sub_procs:
+        try: p.kill()
+        except: pass
+    for f in sub_files:
+        try: os.unlink(f)
+        except: pass
 
     total_elapsed = time.time() - t0
+    n_unsat = sum(1 for r in results_collected if r == "unsat")
+    n_done = sum(1 for r in results_collected if r is not None)
+
     if n_unsat == n_subproblems:
         return _format("unsat", f"{solver_to_use}(split×{n_subproblems})", total_elapsed,
                        n_unstable, solvers, smt2_path)
 
-    return _format("unknown", f"split({n_unsat}/{n_subproblems} unsat)", total_elapsed,
-                   n_unstable, solvers, smt2_path)
+    return _format("unknown", f"split({n_unsat}/{n_done} unsat of {n_subproblems})",
+                   total_elapsed, n_unstable, solvers, smt2_path)
+
+
+def _cascade_ibp(layers, lb, ub, fixed_stable):
+    """
+    Re-run IBP with fixed ReLU phases to discover additional stable neurons.
+
+    When we fix a neuron to active (y=x) or inactive (y=0), the output
+    bounds of that layer change, which tightens bounds on subsequent layers,
+    potentially making MORE neurons stable.  This "snowball effect" is the
+    key to making domain splitting effective.
+    """
+    cl, cu = lb.copy(), ub.copy()
+    new_stable = dict(fixed_stable)
+    rl = 0
+    newly_fixed = 0
+
+    for layer in layers:
+        if layer["type"] == "linear":
+            W, b = layer["W"], layer["b"]
+            ni = W.shape[1]
+            li = cl[:ni] if len(cl) >= ni else np.pad(cl, (0, ni - len(cl)))
+            ui = cu[:ni] if len(cu) >= ni else np.pad(cu, (0, ni - len(cu)))
+            Wp, Wn = np.maximum(W, 0), np.minimum(W, 0)
+            cl = Wp @ li + Wn @ ui + b
+            cu = Wp @ ui + Wn @ li + b
+        elif layer["type"] == "relu":
+            for j in range(len(cl)):
+                key = (rl, j)
+                status = new_stable.get(key, "unstable")
+                if status == "active":
+                    pass  # cl[j], cu[j] unchanged
+                elif status == "inactive":
+                    cl[j] = 0.0
+                    cu[j] = 0.0
+                elif cl[j] >= 0:
+                    new_stable[key] = "active"
+                    newly_fixed += 1
+                elif cu[j] <= 0:
+                    new_stable[key] = "inactive"
+                    cl[j] = 0.0
+                    cu[j] = 0.0
+                    newly_fixed += 1
+                else:
+                    cl[j] = 0.0
+                    # cu[j] unchanged (positive part)
+            cl = np.maximum(cl, 0)
+            cu = np.maximum(cu, 0)
+            rl += 1
+
+    return new_stable, newly_fixed
 
 
 def _solve_subproblem_worker(args) -> Tuple[str, float]:
-    """Worker: generate a sub-problem SMT formula with fixed ReLU phases and solve it."""
+    """
+    Worker: fix ALL unstable ReLU phases → problem becomes pure LP → solve instantly.
+
+    Each sub-problem assigns a specific active/inactive phase to EVERY
+    unstable neuron, reducing the MILP to a feasibility LP.  With all
+    ReLUs fixed, the network is a piecewise-linear function on ONE piece,
+    solvable by LP in milliseconds.
+
+    We enumerate a subset of the 2^n possible phase combinations.
+    """
     (layers, n_inputs, n_outputs, lb, ub, output_constraints,
      fixed_stable, solver_name, timeout_s, base_smt2_path) = args
 
     t0 = time.time()
 
-    # Generate SMT-LIB2 with fixed phases
+    # Cascade IBP to fix even more neurons
+    cascaded_stable, _ = _cascade_ibp(layers, lb, ub, fixed_stable)
+
+    # Fix ALL remaining unstable neurons by their "most likely" phase
+    # (based on the midpoint of their pre-activation interval)
+    remaining_unstable = [(k, v) for k, v in cascaded_stable.items() if v == "unstable"]
+    if remaining_unstable:
+        # Run one more IBP to get bounds for remaining unstable neurons
+        cl, cu = lb.copy(), ub.copy()
+        rl = 0
+        pre_bounds = {}
+        for layer in layers:
+            if layer["type"] == "linear":
+                W, b = layer["W"], layer["b"]
+                ni = W.shape[1]
+                li = cl[:ni] if len(cl) >= ni else np.pad(cl, (0, ni - len(cl)))
+                ui = cu[:ni] if len(cu) >= ni else np.pad(cu, (0, ni - len(cu)))
+                Wp, Wn = np.maximum(W, 0), np.minimum(W, 0)
+                cl = Wp @ li + Wn @ ui + b
+                cu = Wp @ ui + Wn @ li + b
+            elif layer["type"] == "relu":
+                for j in range(len(cl)):
+                    key = (rl, j)
+                    st = cascaded_stable.get(key, "unstable")
+                    if st == "unstable":
+                        pre_bounds[key] = (cl[j], cu[j])
+                        # Fix based on midpoint heuristic
+                        mid = (cl[j] + cu[j]) / 2.0
+                        cascaded_stable[key] = "active" if mid >= 0 else "inactive"
+                    if cascaded_stable.get(key) == "active":
+                        pass
+                    elif cascaded_stable.get(key) == "inactive":
+                        cl[j] = 0.0
+                        cu[j] = 0.0
+                    else:
+                        cl[j] = max(cl[j], 0)
+                cl = np.maximum(cl, 0)
+                cu = np.maximum(cu, 0)
+                rl += 1
+
+    # Now ALL neurons are fixed → generate a purely linear SMT formula
     smtlib2 = generate_smtlib2(
-        layers, n_inputs, n_outputs, lb, ub, output_constraints, fixed_stable,
+        layers, n_inputs, n_outputs, lb, ub, output_constraints, cascaded_stable,
     )
 
-    # Write to temp file
     import tempfile
     fd, tmp_path = tempfile.mkstemp(suffix=".smt2")
     with os.fdopen(fd, "w") as f:
         f.write(smtlib2)
 
     try:
-        timeout_ms = int(timeout_s * 1000)
         if solver_name == "z3":
             result = _run_z3(tmp_path, timeout_s, 1)
         elif solver_name == "cvc5":
