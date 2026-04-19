@@ -223,9 +223,8 @@ def _run_solver_process(args) -> Tuple[str, str, float]:
             r = _run_z3(smt2_path, timeout_s, n_threads)
         elif name == "cvc5":
             r = _run_cvc5(smt2_path, timeout_s, n_threads)
-        elif name == "bitwuzla":
-            r = _run_bitwuzla(smt2_path, timeout_s)
         else:
+            # opensmt or any other binary
             r = _run_generic(name, smt2_path, timeout_s)
         return name, r, time.time() - t0
     except Exception as e:
@@ -246,58 +245,32 @@ def _run_z3(smt2_path: str, timeout_s: float, n_threads: int) -> str:
 
 
 def _run_cvc5(smt2_path: str, timeout_s: float, n_threads: int) -> str:
+    """Run CVC5 via its Python InputParser API.
+    Do NOT call setLogic() — the SMT-LIB2 file already contains (set-logic ...).
+    """
     cmd = [
         "python3", "-c",
         f"""
-import cvc5, sys
+import cvc5
 tm = cvc5.TermManager()
 s = cvc5.Solver(tm)
-s.setOption("produce-models","true")
-s.setOption("tlimit","{int(timeout_s*1000)}")
-s.setLogic("QF_NRA")
+s.setOption("tlimit", "{int(timeout_s * 1000)}")
 parser = cvc5.InputParser(s)
 parser.setFileInput(cvc5.InputLanguage.SMT_LIB_2_6, "{smt2_path}")
 sm = parser.getSymbolManager()
 while True:
     cmd = parser.nextCommand()
-    if cmd.isNull(): break
+    if cmd.isNull():
+        break
     cmd.invoke(s, sm)
 """
     ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s + 10)
-        out = proc.stdout.strip().lower()
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout_s + 10)
+        out = (proc.stdout + proc.stderr).strip().lower()
         if "unsat" in out: return "unsat"
-        if "sat" in out: return "sat"
-    except Exception:
-        pass
-    return "unknown"
-
-
-def _run_bitwuzla(smt2_path: str, timeout_s: float) -> str:
-    cmd = [
-        "python3", "-c",
-        f"""
-import bitwuzla
-opts = bitwuzla.Options()
-opts.set(bitwuzla.Option.TIME_LIMIT, {int(timeout_s * 1000)})
-tm = bitwuzla.TermManager()
-parser = bitwuzla.Parser(tm, opts)
-try:
-    parser.parse("{smt2_path}")
-    bz = parser.bitwuzla()
-    r = bz.check_sat()
-    if r == bitwuzla.Result.SAT: print("sat")
-    elif r == bitwuzla.Result.UNSAT: print("unsat")
-    else: print("unknown")
-except: print("unknown")
-"""
-    ]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s + 10)
-        out = proc.stdout.strip().lower()
-        if "unsat" in out: return "unsat"
-        if "sat" in out: return "sat"
+        if "sat" in out and "unsat" not in out: return "sat"
     except Exception:
         pass
     return "unknown"
@@ -319,22 +292,33 @@ def _run_generic(binary: str, smt2_path: str, timeout_s: float) -> str:
 # Auto-detect available solvers
 # ------------------------------------------------------------------
 
-def detect_solvers(opensmt_path: str = "") -> List[str]:
+def detect_solvers(opensmt_path: str = "", theory: str = "QF_NRA") -> List[str]:
+    """Detect available SMT solvers that support the given theory.
+    Bitwuzla only supports QF_BV/QF_FP — excluded for real arithmetic."""
     avail = []
     try:
-        import z3; avail.append("z3")
-    except ImportError: pass
+        import z3
+        avail.append("z3")
+    except ImportError:
+        pass
     try:
-        import cvc5; avail.append("cvc5")
-    except ImportError: pass
-    try:
-        import bitwuzla; avail.append("bitwuzla")
-    except ImportError: pass
+        import cvc5
+        avail.append("cvc5")
+    except ImportError:
+        pass
+    # Bitwuzla: only for bit-vector theories, not real arithmetic
+    if theory in ("QF_BV", "QF_FP", "QF_ABV", "QF_ABVFP"):
+        try:
+            import bitwuzla
+            avail.append("bitwuzla")
+        except ImportError:
+            pass
     osmt = opensmt_path or "opensmt"
     try:
         subprocess.run([osmt, "--version"], capture_output=True, timeout=3)
         avail.append("opensmt")
-    except Exception: pass
+    except Exception:
+        pass
     return avail
 
 
