@@ -18,6 +18,7 @@ from .z3_solver import verify_with_z3
 from .smt_solver import verify_with_smt
 from .gurobi_solver import verify_with_gurobi, verify_pytorch_with_gurobi
 from .symbolic_rewrite import symbolic_rewrite_preprocess, RewriteStats
+from .padic_analysis import padic_reduce, PAdicReductionStats
 
 __all__ = [
     "BENCHMARKS",

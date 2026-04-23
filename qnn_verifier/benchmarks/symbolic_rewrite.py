@@ -381,6 +381,18 @@ def symbolic_rewrite_preprocess(
                 if all_unsat:
                     stats.early_unsat = True
 
+    # Phase 6: p-adic analysis
+    try:
+        from .padic_analysis import padic_reduce
+        simplified_layers, stable, padic_stats = padic_reduce(
+            simplified_layers, lb, ub, stable,
+            p=2, pruning_threshold=8, cluster_radius=0.5,
+        )
+        stats.bounds_tightened += padic_stats.relu_phases_determined
+        logger.info(f"p-adic: {padic_stats.summary()}")
+    except Exception as e:
+        logger.debug(f"p-adic analysis skipped: {e}")
+
     stats.time_seconds = time.time() - t0
     logger.info(stats.summary())
 
