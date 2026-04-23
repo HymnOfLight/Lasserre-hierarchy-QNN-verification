@@ -11,7 +11,8 @@ from qnn_verifier.benchmarks.vnnlib_parser import VNNLIBProperty, parse_vnnlib
 class TestRegistry:
     def test_all_benchmarks_registered(self):
         expected = {"acasxu", "cgan", "nn4sys", "linearizenn", "ml4acopf",
-                    "vit", "collins_aerospace", "lsnc", "cctsdb"}
+                    "vit", "collins_aerospace", "lsnc", "cctsdb",
+                    "vggnet16", "yolo", "cifar100"}
         assert expected == set(BENCHMARKS.keys())
 
     def test_benchmark_info_fields(self):
@@ -21,13 +22,18 @@ class TestRegistry:
         assert acas.dir_name == "acasxu_2023"
         assert "safety-critical" in acas.tags
 
+    def test_new_benchmarks(self):
+        assert BENCHMARKS["vggnet16"].dir_name == "vggnet16_2023"
+        assert BENCHMARKS["yolo"].dir_name == "yolo_2023"
+        assert BENCHMARKS["cifar100"].dir_name == "cifar100"
+
     def test_list_benchmarks_all(self):
         all_b = list_benchmarks()
-        assert len(all_b) == 9
+        assert len(all_b) == 12
 
     def test_list_benchmarks_complex(self):
         complex_b = list_benchmarks(category="complex")
-        assert len(complex_b) == 8
+        assert len(complex_b) == 11
         for b in complex_b:
             assert b.category == "complex"
 

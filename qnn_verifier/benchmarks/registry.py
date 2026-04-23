@@ -115,6 +115,36 @@ BENCHMARKS: Dict[str, BenchmarkInfo] = {
         needs_large_download=True,
         tags=["detection", "YOLO", "traffic-signs", "convolution"],
     ),
+    "vggnet16": BenchmarkInfo(
+        name="VGGNet16",
+        category="complex",
+        description="VGG-16 image classification robustness verification. "
+                    "18 ImageNet instances with adversarial perturbation.",
+        dir_name="vggnet16_2023",
+        n_instances=18,
+        needs_large_download=True,
+        tags=["classification", "convolution", "ImageNet", "VGG"],
+    ),
+    "yolo": BenchmarkInfo(
+        name="YOLO",
+        category="complex",
+        description="TinyYOLO object detection robustness verification. "
+                    "72 instances with L_inf perturbation eps=1/255.",
+        dir_name="yolo_2023",
+        n_instances=72,
+        needs_large_download=True,
+        tags=["detection", "YOLO", "convolution", "object-detection"],
+    ),
+    "cifar100": BenchmarkInfo(
+        name="CIFAR100",
+        category="complex",
+        description="CIFAR-100 ResNet classification robustness. "
+                    "200 instances with small/medium/large models.",
+        dir_name="cifar100",
+        n_instances=200,
+        needs_large_download=True,
+        tags=["classification", "ResNet", "CIFAR", "convolution"],
+    ),
 }
 
 
