@@ -92,7 +92,7 @@ def parse_instance_info(instances):
 
 
 def run_verification(indices, instances, solver, n_cores, timeout):
-    """Run verification on selected instances."""
+    """Run verification on selected instances, collecting witnesses."""
     results = []
     for info in indices:
         idx = info["idx"]
@@ -102,11 +102,18 @@ def run_verification(indices, instances, solver, n_cores, timeout):
                                   n_workers=n_cores, threads_per_worker=n_cores)
             tag = {"verified": "V", "violated": "X", "unknown": "?"}.get(res.result, "E")
             results.append({"info": info, "result": res.result, "time": res.time_seconds,
-                            "tag": tag, "details": res.details})
+                            "tag": tag, "details": res.details, "res_obj": res})
             print(f"  [{tag}] net={info['model']:>5} {info['prop']:<8} "
                   f"bound={res.lower_bound:+.4f} {res.time_seconds:.2f}s")
+            # Print witness for violated/verified
+            if res.result == "violated" and res.witness_input:
+                print(f"       CEX input:  {[f'{v:.6f}' for v in res.witness_input]}")
+                print(f"       CEX output: {[f'{v:.6f}' for v in (res.witness_output or [])]}")
+            elif res.result == "verified" and res.output_bounds_upper:
+                print(f"       Output UB:  {[f'{v:.4f}' for v in res.output_bounds_upper[:5]]}")
         except Exception as e:
-            results.append({"info": info, "result": "error", "time": 0, "tag": "E", "details": str(e)})
+            results.append({"info": info, "result": "error", "time": 0, "tag": "E",
+                            "details": str(e), "res_obj": None})
             print(f"  [E] net={info['model']:>5} {info['prop']:<8} ERROR: {e}")
     return results
 
