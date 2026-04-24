@@ -28,24 +28,49 @@ class BenchmarkVerificationResult:
     instance_idx: int = 0
     model_name: str = ""
     property_name: str = ""
-    result: str = "unknown"  # "verified", "violated", "unknown", "timeout", "error"
+    result: str = "unknown"
     lower_bound: float = float("-inf")
     time_seconds: float = 0.0
     method: str = ""
     details: str = ""
+    witness_input: Optional[List[float]] = None
+    witness_output: Optional[List[float]] = None
+    output_bounds_lower: Optional[List[float]] = None
+    output_bounds_upper: Optional[List[float]] = None
 
     def __str__(self):
-        tag = {
-            "verified": "VERIFIED  ",
-            "violated": "VIOLATED  ",
-            "unknown":  "UNKNOWN   ",
-            "timeout":  "TIMEOUT   ",
-            "error":    "ERROR     ",
-        }.get(self.result, self.result)
+        tag = {"verified": "VERIFIED  ", "violated": "VIOLATED  ",
+               "unknown": "UNKNOWN   ", "timeout": "TIMEOUT   ",
+               "error": "ERROR     "}.get(self.result, self.result)
         return (
             f"[{tag}] {self.model_name} | {self.property_name} | "
             f"bound={self.lower_bound:+.6f} | {self.time_seconds:.2f}s | {self.method}"
         )
+
+    def witness_str(self) -> str:
+        """Human-readable witness/counterexample."""
+        lines = []
+        if self.result == "verified":
+            lines.append(f"  WITNESS (safety proof):")
+            lines.append(f"    Method: {self.method}")
+            lines.append(f"    Margin: {self.lower_bound:+.6f}")
+            if self.output_bounds_lower:
+                lines.append(f"    Output lower: {[f'{v:.4f}' for v in self.output_bounds_lower[:5]]}")
+            if self.output_bounds_upper:
+                lines.append(f"    Output upper: {[f'{v:.4f}' for v in self.output_bounds_upper[:5]]}")
+        elif self.result == "violated":
+            lines.append(f"  COUNTEREXAMPLE:")
+            if self.witness_input:
+                lines.append(f"    Input:  {[f'{v:.6f}' for v in self.witness_input]}")
+            if self.witness_output:
+                lines.append(f"    Output: {[f'{v:.6f}' for v in self.witness_output]}")
+        elif self.result == "unknown":
+            lines.append(f"  INCONCLUSIVE (margin={self.lower_bound:+.6f}):")
+            if self.witness_input:
+                lines.append(f"    Nominal input:  {[f'{v:.6f}' for v in self.witness_input]}")
+            if self.witness_output:
+                lines.append(f"    Nominal output: {[f'{v:.6f}' for v in self.witness_output]}")
+        return "\n".join(lines)
 
 
 def verify_instance(
@@ -186,9 +211,15 @@ def verify_instance(
     res.time_seconds = time.time() - t0
     res.method = "jacobian" if is_differentiable else "sampling"
 
+    # Always store bounds as witness data
+    res.output_bounds_lower = output_lower[:prop.n_outputs].tolist()
+    res.output_bounds_upper = output_upper[:prop.n_outputs].tolist()
+
     if not unsafe_reachable:
         res.result = "verified"
-        res.details = f"Unsafe region excluded for all {len(prop.output_constraints)} constraints"
+        res.details = f"Unsafe region excluded (margin={min_margin:.6f})"
+        res.witness_input = x0.tolist()
+        res.witness_output = output_nominal[:prop.n_outputs].tolist()
     else:
         # Check nominal: is the nominal point already in the unsafe region?
         nominal_unsafe = True
@@ -197,14 +228,57 @@ def verify_instance(
             if not sat:
                 nominal_unsafe = False
                 break
+
         if nominal_unsafe:
             res.result = "violated"
-            res.details = "Nominal input already in unsafe region"
+            res.details = "Nominal input in unsafe region"
+            res.witness_input = x0.tolist()
+            res.witness_output = output_nominal[:prop.n_outputs].tolist()
         else:
-            res.result = "unknown"
-            res.details = f"Cannot exclude unsafe region (margin={min_margin:.6f})"
+            # Try random sampling to find a counterexample
+            cex_input, cex_output = _search_counterexample(
+                model, instance.input_shape, lb, ub, prop, n_samples=500
+            )
+            if cex_input is not None:
+                res.result = "violated"
+                res.details = "Counterexample found by sampling"
+                res.witness_input = cex_input.tolist()
+                res.witness_output = cex_output.tolist()
+            else:
+                res.result = "unknown"
+                res.details = f"Cannot exclude unsafe region (margin={min_margin:.6f})"
+                res.witness_input = x0.tolist()
+                res.witness_output = output_nominal[:prop.n_outputs].tolist()
 
     return res
+
+
+def _search_counterexample(model, input_shape, lb, ub, prop, n_samples=500):
+    """
+    Random sampling to find a concrete input that satisfies the unsafe property.
+    Returns (cex_input, cex_output) or (None, None).
+    """
+    import torch
+    n_inputs = len(lb)
+    for _ in range(n_samples):
+        x_rand = np.random.uniform(lb, ub).astype(np.float32)
+        try:
+            x_t = torch.tensor(x_rand).reshape(input_shape)
+            with torch.no_grad():
+                out = model(x_t).detach().flatten().numpy()
+
+            # Check if this input satisfies ALL unsafe constraints
+            all_sat = True
+            for c in prop.output_constraints:
+                sat, _ = _check_constraint_point(c, out)
+                if not sat:
+                    all_sat = False
+                    break
+            if all_sat:
+                return x_rand, out
+        except Exception:
+            pass
+    return None, None
 
 
 def _compute_output_bounds(
