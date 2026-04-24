@@ -117,6 +117,7 @@ def run_compare(benchmark_name, indices, timeout, n_cores):
         ("Jacobian",  "jacobian"),
         ("SMT",       "smt"),
         ("Gurobi",    "gurobi"),
+        ("Frama-C",   "framac"),
     ]
 
     for label, method in solvers:
@@ -185,7 +186,10 @@ def main():
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--solver", type=str, default="jacobian",
                         choices=["jacobian", "z3", "cvc5", "opensmt",
-                                 "smt", "portfolio", "gurobi", "sdp"])
+                                 "smt", "portfolio", "gurobi", "framac",
+                                 "framac-eva", "framac-wp", "sdp"])
+    parser.add_argument("--no-padic", action="store_true",
+                        help="Disable p-adic analysis phase")
     parser.add_argument("--cores", type=int, default=0,
                         help="Total CPU cores to use (0=auto, e.g. 32)")
     parser.add_argument("--timeout", type=float, default=None)
@@ -195,6 +199,10 @@ def main():
     args = parser.parse_args()
 
     n_cores = args.cores or os.cpu_count() or 4
+
+    if hasattr(args, 'no_padic') and args.no_padic:
+        from qnn_verifier.benchmarks.symbolic_rewrite import set_padic_enabled
+        set_padic_enabled(False)
 
     if args.list:
         print_benchmarks()

@@ -74,6 +74,9 @@ def verify_instance(
         return _verify_with_smt_portfolio(instance, timeout, method, n_workers, threads_per_worker)
     if method == "gurobi":
         return _verify_with_gurobi(instance, timeout, n_workers)
+    if method in ("framac", "frama-c", "framac-eva", "framac-wp"):
+        mode = "wp" if method == "framac-wp" else "eva" if method == "framac-eva" else "both"
+        return _verify_with_framac(instance, timeout, n_workers, mode)
 
     from pathlib import Path
     t0 = time.time()
@@ -598,5 +601,42 @@ def _verify_with_gurobi(
     res.result = result["result"]
     res.time_seconds = result["time_seconds"]
     res.method = "gurobi"
+    res.details = result.get("details", "")
+    return res
+
+
+def _verify_with_framac(
+    instance: BenchmarkInstance,
+    timeout: Optional[float] = None,
+    n_workers: int = 0,
+    mode: str = "both",
+) -> BenchmarkVerificationResult:
+    from pathlib import Path
+    from .framac_solver import verify_with_framac
+
+    res = BenchmarkVerificationResult(
+        benchmark=instance.benchmark_name,
+        model_name=Path(instance.model_path).stem,
+        property_name=Path(instance.property_path).stem,
+    )
+    if instance.property is None:
+        res.result, res.details = "error", "Property not loaded"
+        return res
+    if not Path(instance.model_path).exists():
+        res.result, res.details = "error", "Model file not found"
+        return res
+
+    result = verify_with_framac(
+        onnx_path=instance.model_path,
+        property=instance.property,
+        timeout=timeout or instance.timeout or 300.0,
+        save_code=True,
+        benchmark_name=instance.benchmark_name,
+        instance_name=Path(instance.property_path).stem,
+        mode=mode,
+    )
+    res.result = result["result"]
+    res.time_seconds = result["time_seconds"]
+    res.method = result.get("solver", "frama-c")
     res.details = result.get("details", "")
     return res

@@ -19,6 +19,8 @@ from .smt_solver import verify_with_smt
 from .gurobi_solver import verify_with_gurobi, verify_pytorch_with_gurobi
 from .symbolic_rewrite import symbolic_rewrite_preprocess, RewriteStats
 from .padic_analysis import padic_reduce, PAdicReductionStats
+from .framac_solver import verify_with_framac
+from .symbolic_rewrite import set_padic_enabled
 
 __all__ = [
     "BENCHMARKS",
