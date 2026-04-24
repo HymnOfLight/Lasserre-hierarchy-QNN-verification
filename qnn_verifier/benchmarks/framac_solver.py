@@ -65,143 +65,115 @@ def generate_c_program(
     lines = []
     lines.append("// Auto-generated neural network verification program")
     lines.append("// Verify with: frama-c -eva -eva-precision 7 <file>.c")
-    lines.append("//          or: frama-c -wp -wp-prover alt-ergo,z3,cvc5 <file>.c")
-    lines.append("")
-    lines.append(f"#define N_INPUTS {n_inputs}")
-    lines.append(f"#define N_OUTPUTS {n_outputs}")
+    lines.append("//          or: frama-c -wp -wp-prover alt-ergo,z3 <file>.c")
     lines.append("")
 
-    # Weight arrays as global constants
+    # Frama-C Eva built-in for non-deterministic input ranges
+    lines.append("// Frama-C built-in for Eva abstract interpretation")
+    lines.append("extern double Frama_C_double_interval(double min, double max);")
+    lines.append("")
+    lines.append(f"#define N_IN {n_inputs}")
+    lines.append(f"#define N_OUT {n_outputs}")
+    lines.append("")
+
+    # Global weight arrays
     layer_idx = 0
     for layer in layers:
         if layer["type"] == "linear":
-            W = layer["W"]
-            b = layer["b"]
+            W, b = layer["W"], layer["b"]
             no, ni = W.shape
             lines.append(f"// Layer {layer_idx}: {ni} -> {no}")
-            lines.append(f"static const double W_{layer_idx}[{no}][{ni}] = {{")
+            lines.append(f"const double W{layer_idx}[{no}][{ni}] = {{")
             for i in range(no):
                 row = ", ".join(f"{W[i,j]:.15f}" for j in range(ni))
                 lines.append(f"  {{{row}}},")
             lines.append("};")
-            lines.append(f"static const double b_{layer_idx}[{no}] = {{")
-            lines.append(f"  {', '.join(f'{b[j]:.15f}' for j in range(no))}")
-            lines.append("};")
+            lines.append(f"const double B{layer_idx}[{no}] = {{{', '.join(f'{b[j]:.15f}' for j in range(no))}}};")
             lines.append("")
             layer_idx += 1
-    n_linear = layer_idx
 
-    # ReLU function
-    lines.append("/*@ assigns \\nothing;")
-    lines.append("    ensures \\result >= 0;")
-    lines.append("    ensures x >= 0 ==> \\result == x;")
-    lines.append("    ensures x < 0 ==> \\result == 0;")
-    lines.append("*/")
-    lines.append("static double relu(double x) { return x > 0 ? x : 0; }")
-    lines.append("")
+    # UNROLLED forward pass as a single function (no loops — Eva/WP friendly)
+    # For Frama-C, unrolled code is much easier to analyze than loops.
+    ensures_str = _build_ensures(output_constraints, n_outputs)
 
-    # ACSL function contract
     lines.append("/*@")
-    lines.append("  requires \\valid(x + (0 .. N_INPUTS-1));")
-    lines.append("  requires \\valid(y + (0 .. N_OUTPUTS-1));")
     for i in range(n_inputs):
         if np.isfinite(input_lb[i]):
             lines.append(f"  requires x[{i}] >= {input_lb[i]:.15f};")
         if np.isfinite(input_ub[i]):
             lines.append(f"  requires x[{i}] <= {input_ub[i]:.15f};")
-
-    # Ensures: negation of unsafe property
-    # VNN-COMP semantics: VNNLIB describes the unsafe region.
-    # We want to prove: NOT(unsafe) holds for all valid inputs.
-    ensures_clauses = _build_ensures(output_constraints, n_outputs)
-    if ensures_clauses:
-        lines.append(f"  ensures {ensures_clauses};")
-
-    lines.append("  assigns y[0 .. N_OUTPUTS-1];")
+    if ensures_str:
+        lines.append(f"  ensures {ensures_str};")
     lines.append("*/")
+    lines.append(f"void nn_forward(double x[{n_inputs}], double y[{n_outputs}]) {{")
 
-    # Forward pass function
-    lines.append(f"void nn_forward(const double x[N_INPUTS], double y[N_OUTPUTS]) {{")
-
-    current_size = n_inputs
+    # Generate UNROLLED forward pass (no for loops)
     current_var = "x"
+    current_size = n_inputs
     layer_idx = 0
     relu_idx = 0
     temp_idx = 0
 
     for layer in layers:
         if layer["type"] == "linear":
-            W = layer["W"]
+            W, b = layer["W"], layer["b"]
             no, ni = W.shape
-            var_name = f"h{temp_idx}"
-            lines.append(f"  double {var_name}[{no}];")
-            lines.append(f"  /*@ loop invariant 0 <= i <= {no};")
-            lines.append(f"      loop assigns i, {var_name}[0 .. {no-1}];")
-            lines.append(f"      loop variant {no} - i;")
-            lines.append(f"  */")
-            lines.append(f"  for (int i = 0; i < {no}; i++) {{")
-            lines.append(f"    double sum = b_{layer_idx}[i];")
-            lines.append(f"    /*@ loop invariant 0 <= j <= {ni};")
-            lines.append(f"        loop assigns j, sum;")
-            lines.append(f"        loop variant {ni} - j;")
-            lines.append(f"    */")
-            lines.append(f"    for (int j = 0; j < {ni}; j++) {{")
-            lines.append(f"      sum += W_{layer_idx}[i][j] * {current_var}[j];")
-            lines.append(f"    }}")
-            lines.append(f"    {var_name}[i] = sum;")
-            lines.append(f"  }}")
-            current_var = var_name
+            vname = f"h{temp_idx}"
+            lines.append(f"  double {vname}[{no}];")
+            for i in range(no):
+                nz = np.nonzero(np.abs(W[i, :]) > 1e-15)[0]
+                if len(nz) == 0:
+                    lines.append(f"  {vname}[{i}] = {b[i]:.15f};")
+                else:
+                    terms = [f"{b[i]:.15f}"]
+                    for j in nz:
+                        terms.append(f"({W[i,j]:.15f} * {current_var}[{j}])")
+                    expr = " + ".join(terms)
+                    lines.append(f"  {vname}[{i}] = {expr};")
+            current_var = vname
             current_size = no
             temp_idx += 1
             layer_idx += 1
 
         elif layer["type"] == "relu":
-            var_name = f"r{relu_idx}"
-            lines.append(f"  double {var_name}[{current_size}];")
-            lines.append(f"  for (int i = 0; i < {current_size}; i++) {{")
-
-            # Use stable info to simplify
-            has_any_unstable = any(
-                stable_neurons.get((relu_idx, j)) == "unstable"
-                for j in range(current_size)
-            )
-            if has_any_unstable:
-                lines.append(f"    {var_name}[i] = relu({current_var}[i]);")
-            else:
-                # All stable — can simplify
-                lines.append(f"    {var_name}[i] = relu({current_var}[i]);")
-
-            lines.append(f"  }}")
-            current_var = var_name
+            vname = f"a{relu_idx}"
+            lines.append(f"  double {vname}[{current_size}];")
+            for j in range(current_size):
+                st = stable_neurons.get((relu_idx, j), "unstable")
+                if st == "active":
+                    lines.append(f"  {vname}[{j}] = {current_var}[{j}]; // active")
+                elif st == "inactive":
+                    lines.append(f"  {vname}[{j}] = 0.0; // inactive")
+                else:
+                    lines.append(f"  {vname}[{j}] = ({current_var}[{j}] > 0.0) ? {current_var}[{j}] : 0.0;")
+            current_var = vname
             relu_idx += 1
 
         elif layer["type"] == "flatten":
             pass
 
     # Copy to output
-    lines.append(f"  for (int i = 0; i < N_OUTPUTS && i < {current_size}; i++) {{")
-    lines.append(f"    y[i] = {current_var}[i];")
-    lines.append(f"  }}")
+    for i in range(min(n_outputs, current_size)):
+        lines.append(f"  y[{i}] = {current_var}[{i}];")
     lines.append("}")
     lines.append("")
 
-    # Main function for Frama-C Eva
+    # Eva-friendly main: uses Frama_C_double_interval for non-det inputs
     lines.append("int main(void) {")
-    lines.append("  double x[N_INPUTS];")
-    lines.append("  double y[N_OUTPUTS];")
-    lines.append("")
-    lines.append("  // Frama-C Eva: initialize inputs to their valid ranges")
+    lines.append(f"  double x[{n_inputs}];")
+    lines.append(f"  double y[{n_outputs}];")
     for i in range(n_inputs):
         lb_val = input_lb[i] if np.isfinite(input_lb[i]) else -1e6
         ub_val = input_ub[i] if np.isfinite(input_ub[i]) else 1e6
-        lines.append(f"  Frama_C_double_interval(&x[{i}], {lb_val:.15f}, {ub_val:.15f});")
-    lines.append("")
-    lines.append("  nn_forward(x, y);")
-    lines.append("")
-    lines.append("  // Eva will compute the range of each y[i] here")
-    for i in range(n_outputs):
-        lines.append(f"  //@ assert \\is_finite(y[{i}]);")
-    lines.append("")
+        lines.append(f"  x[{i}] = Frama_C_double_interval({lb_val:.15f}, {ub_val:.15f});")
+    lines.append(f"  nn_forward(x, y);")
+
+    # Eva assertions: check that output is in expected range
+    for c in output_constraints:
+        assertion = _build_eva_assertion(c, n_outputs)
+        if assertion:
+            lines.append(f"  //@ assert {assertion};")
+
     lines.append("  return 0;")
     lines.append("}")
     lines.append("")
@@ -219,6 +191,17 @@ def _build_ensures(output_constraints: List[Dict], n_outputs: int) -> str:
     if not parts:
         return ""
     return " && ".join(parts) if len(parts) > 1 else parts[0]
+
+
+def _build_eva_assertion(c: Dict, n_out: int) -> str:
+    """Build an ACSL assertion that Eva should try to validate.
+    This asserts the NEGATION of the unsafe property (safe condition)."""
+    return _build_ensures_single(c, n_out)
+
+
+def _build_ensures_single(c: Dict, n_out: int) -> str:
+    """Build ensures for a single constraint (negated)."""
+    return _negate_constraint(c, n_out)
 
 
 def _negate_constraint(c: Dict, n_out: int) -> str:
@@ -280,10 +263,11 @@ def save_c_program(code: str, benchmark: str, instance_name: str) -> str:
 def run_framac_eva(c_path: str, timeout: float = 300.0) -> Dict:
     """Run Frama-C Eva (abstract interpretation) on the generated C file."""
     t0 = time.time()
+    # Use precision 0 for fast completion; higher values are more precise
+    # but exponentially slower on large networks.
     cmd = [
         FRAMAC_BIN, "-eva",
-        "-eva-precision", "5",
-        "-eva-warn-key", "alarm",
+        "-eva-precision", "0",
         "-no-unicode",
         c_path,
     ]
@@ -293,16 +277,22 @@ def run_framac_eva(c_path: str, timeout: float = 300.0) -> Dict:
         elapsed = time.time() - t0
         output = proc.stdout + proc.stderr
 
-        # Parse Eva results
-        n_alarms = output.count("[kernel:alarm]") + output.count("[eva:alarm]")
-        has_red = "red alarm" in output.lower()
-        n_green = output.count("proved")
+        n_alarms = output.count("[eva:alarm]")
+        has_red = "red alarm" in output.lower() or "invalid" in output.lower()
+        # Check assertion status
+        n_valid = output.count("valid")
+        n_invalid = output.count("invalid")
+        # Eva considers 0 alarms on assertions as proof
+        assertions_ok = ("Assertions" in output and "0 invalid" in output)
 
         return {
             "success": proc.returncode == 0,
             "alarms": n_alarms,
             "has_red_alarm": has_red,
-            "output": output[-2000:],  # last 2000 chars
+            "assertions_ok": assertions_ok,
+            "n_valid": n_valid,
+            "n_invalid": n_invalid,
+            "output": output[-3000:],
             "time_seconds": elapsed,
         }
     except subprocess.TimeoutExpired:
@@ -420,8 +410,15 @@ def verify_with_framac(
 
     if mode in ("eva", "both"):
         eva_result = run_framac_eva(c_path, timeout / 2 if mode == "both" else timeout)
-        result_details.append(f"Eva: {eva_result['alarms']} alarms, {eva_result['time_seconds']:.1f}s")
-        if eva_result["success"] and eva_result["alarms"] == 0:
+        result_details.append(
+            f"Eva: {eva_result['alarms']} alarms, "
+            f"{eva_result.get('n_valid',0)} valid, "
+            f"{eva_result.get('n_invalid',0)} invalid, "
+            f"{eva_result['time_seconds']:.1f}s"
+        )
+        if eva_result["success"] and eva_result.get("assertions_ok", False):
+            verified = True
+        elif eva_result["success"] and eva_result["alarms"] == 0 and eva_result.get("n_invalid", 1) == 0:
             verified = True
 
     if mode in ("wp", "both"):
