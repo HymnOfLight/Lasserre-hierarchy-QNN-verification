@@ -187,7 +187,7 @@ def main():
     parser.add_argument("--solver", type=str, default="jacobian",
                         choices=["jacobian", "z3", "cvc5", "opensmt",
                                  "smt", "portfolio", "gurobi", "framac",
-                                 "framac-eva", "framac-wp", "sdp"])
+                                 "framac-eva", "framac-wp", "cbmc", "sdp"])
     parser.add_argument("--no-padic", action="store_true",
                         help="Disable p-adic analysis phase")
     parser.add_argument("--cores", type=int, default=0,
