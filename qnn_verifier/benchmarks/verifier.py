@@ -102,6 +102,8 @@ def verify_instance(
     if method in ("framac", "frama-c", "framac-eva", "framac-wp"):
         mode = "wp" if method == "framac-wp" else "eva" if method == "framac-eva" else "both"
         return _verify_with_framac(instance, timeout, n_workers, mode)
+    if method == "cbmc":
+        return _verify_with_cbmc(instance, timeout, n_workers)
 
     from pathlib import Path
     t0 = time.time()
@@ -713,4 +715,47 @@ def _verify_with_framac(
     res.time_seconds = result["time_seconds"]
     res.method = result.get("solver", "frama-c")
     res.details = result.get("details", "")
+    return res
+
+
+def _verify_with_cbmc(
+    instance: BenchmarkInstance,
+    timeout: Optional[float] = None,
+    n_workers: int = 0,
+) -> BenchmarkVerificationResult:
+    from pathlib import Path
+    from .cbmc_solver import verify_with_cbmc
+
+    res = BenchmarkVerificationResult(
+        benchmark=instance.benchmark_name,
+        model_name=Path(instance.model_path).stem,
+        property_name=Path(instance.property_path).stem,
+    )
+    if instance.property is None:
+        res.result, res.details = "error", "Property not loaded"
+        return res
+    if not Path(instance.model_path).exists():
+        res.result, res.details = "error", "Model file not found"
+        return res
+
+    result = verify_with_cbmc(
+        onnx_path=instance.model_path,
+        property=instance.property,
+        timeout=timeout or instance.timeout or 300.0,
+        save_code=True,
+        benchmark_name=instance.benchmark_name,
+        instance_name=Path(instance.property_path).stem,
+    )
+    res.result = result["result"]
+    res.time_seconds = result["time_seconds"]
+    res.method = "cbmc"
+    res.details = result.get("details", "")
+    if result.get("counterexample"):
+        cex = result["counterexample"]
+        if cex.get("inputs"):
+            res.witness_input = [cex["inputs"].get(f"x[{i}]", 0.0)
+                                 for i in range(instance.property.n_inputs)]
+        if cex.get("outputs"):
+            res.witness_output = [cex["outputs"].get(f"y[{i}]", 0.0)
+                                  for i in range(instance.property.n_outputs)]
     return res

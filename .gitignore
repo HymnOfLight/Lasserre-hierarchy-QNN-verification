@@ -13,4 +13,5 @@ benchmarks_data/
 smt_formulas/
 gurobi_lp/
 framac_output/
+cbmc_output/
 acasxu_results/
